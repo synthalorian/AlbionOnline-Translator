@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, info};
+use std::path::PathBuf;
+use tracing::{debug, info, warn};
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 
 /// Translation engine with pluggable backends
-/// Supports: Google Translate API, lingua-rs detection, caching
+/// Priority: CTranslate2 (local) > Google Translate API > fallback tag
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationRequest {
@@ -44,6 +45,8 @@ pub struct TranslationEngine {
     google_api_key: Option<String>,
     http_client: reqwest::Client,
     detector: LanguageDetector,
+    ct2_translator: Option<ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>>,
+    model_dir: PathBuf,
 }
 
 impl TranslationEngine {
@@ -70,12 +73,68 @@ impl TranslationEngine {
             .with_minimum_relative_distance(0.25)
             .build();
         
+        // Look for CTranslate2 models
+        let model_dir = Self::find_model_dir();
+        let ct2_translator = Self::load_ct2_model(&model_dir);
+        
         Self {
             target_language: "en".to_string(),
             cache: HashMap::new(),
             google_api_key,
             http_client: reqwest::Client::new(),
             detector,
+            ct2_translator,
+            model_dir,
+        }
+    }
+
+    fn find_model_dir() -> PathBuf {
+        // Check environment variable first
+        if let Ok(dir) = std::env::var("ALBION_TRANSLATION_MODEL_DIR") {
+            return PathBuf::from(dir);
+        }
+        
+        // Check next to executable
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                let bundled = exe_dir.join("models");
+                if bundled.exists() {
+                    return bundled;
+                }
+            }
+        }
+        
+        // Check user cache
+        if let Some(cache_dir) = dirs::cache_dir() {
+            let user_models = cache_dir.join("albion-translator").join("models");
+            if user_models.exists() {
+                return user_models;
+            }
+        }
+        
+        // Default to ./models
+        PathBuf::from("models")
+    }
+
+    fn load_ct2_model(model_dir: &PathBuf) -> Option<ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>> {
+        // Try to load es-en model as default
+        let model_path = model_dir.join("opus-mt-es-en-ct2");
+        
+        if !model_path.exists() {
+            info!("No CTranslate2 model found at {:?}, local translation disabled", model_path);
+            return None;
+        }
+        
+        let config = ct2rs::Config::default();
+        match ct2rs::Translator::new(&model_path, &config) {
+            Ok(translator) => {
+                info!("Loaded CTranslate2 model from {:?}", model_path);
+                Some(translator)
+            }
+            Err(e) => {
+                warn!("Failed to load CTranslate2 model: {}", e);
+                None
+            }
         }
     }
 
@@ -86,6 +145,11 @@ impl TranslationEngine {
 
     pub fn target_language(&self) -> &str {
         &self.target_language
+    }
+
+    /// Check if local translation is available
+    pub fn has_local_translation(&self) -> bool {
+        self.ct2_translator.is_some()
     }
 
     /// Translate text, using cache when possible
@@ -123,6 +187,19 @@ impl TranslationEngine {
             return Some(cached.clone());
         }
 
+        // Try CTranslate2 first (free, local)
+        if let Some(ref translator) = self.ct2_translator {
+            match self.translate_ct2(translator, trimmed, detected.as_deref()).await {
+                Ok(translated) => {
+                    self.cache.insert(cache_key, translated.clone());
+                    return Some(translated);
+                }
+                Err(e) => {
+                    debug!("CTranslate2 failed: {}", e);
+                }
+            }
+        }
+
         // Try Google Translate if API key is available
         if let Some(api_key) = &self.google_api_key {
             match self.translate_google(trimmed, &self.target_language.clone(), api_key).await {
@@ -141,6 +218,27 @@ impl TranslationEngine {
         let fallback = format!("[{}] {}", lang_tag, trimmed);
         self.cache.insert(cache_key, fallback.clone());
         Some(fallback)
+    }
+
+    async fn translate_ct2(
+        &self,
+        translator: &ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>,
+        text: &str,
+        source_lang: Option<&str>,
+    ) -> Result<String, anyhow::Error> {
+        let _source = source_lang.unwrap_or("es");
+        
+        // Use ct2rs translate_batch
+        let sources = vec![text.to_string()];
+        let options = ct2rs::TranslationOptions::default();
+        
+        let results = translator.translate_batch(&sources, &options, None)?;
+        
+        let translated = results.first()
+            .map(|(text, _)| text.clone())
+            .unwrap_or_else(|| text.to_string());
+        
+        Ok(translated)
     }
 
     async fn translate_google(
