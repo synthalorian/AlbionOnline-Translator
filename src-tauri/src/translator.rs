@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Translation engine with pluggable backends
 /// Currently scaffolds the interface - real implementation will use CTranslate2 or HTTP APIs

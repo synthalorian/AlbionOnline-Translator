@@ -18,8 +18,8 @@
         "minWidth": 320,
         "minHeight": 400,
         "alwaysOnTop": true,
-        "transparent": true,
-        "decorations": false,
+        "transparent": false,
+        "decorations": true,
         "skipTaskbar": false
       }
     ],
