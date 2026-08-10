@@ -5,12 +5,17 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use albion_network_lib::{
-    DecodedPacket, ExtractedPacket, PhotonParser, PhotonParserConfig,
+    DecodedPacket, ExtractedPacket, HostFilter, PhotonParser, PhotonParserConfig,
     extract_udp_payload,
 };
 
 use crate::photon::{ChatMessage as UiChatMessage, ChatChannel as UiChatChannel};
 use crate::translator::TranslationEngine;
+
+// Albion Online server IP ranges (from albion-translator hosts.txt)
+const ALBION_CIDRS: &[&str] = &[
+    "5.188.125.0/24",
+];
 
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
@@ -54,10 +59,16 @@ impl PacketSniffer {
         tokio::spawn(async move {
             info!("Packet capture started");
             
+            // Build host filter for Albion servers
+            let host_filter = HostFilter::from_cidrs(ALBION_CIDRS.iter().map(|s| *s))
+                .expect("Invalid CIDR range");
+            info!("Filtering to {} Albion server ranges", host_filter.len());
+            
             let config = PhotonParserConfig::with_defaults("live".to_string(), false);
             let mut parser = PhotonParser::new(config);
             let mut translator = TranslationEngine::new();
             let mut packet_number = 0usize;
+            let mut filtered_count = 0usize;
             
             while running.load(Ordering::SeqCst) {
                 match cap.next_packet() {
@@ -65,6 +76,13 @@ impl PacketSniffer {
                         packet_number += 1;
                         
                         if let Some(udp_packet) = extract_udp_payload(packet.data, None) {
+                            // Filter to Albion servers only
+                            if !host_filter.contains(udp_packet.source.ip) 
+                                && !host_filter.contains(udp_packet.destination.ip) {
+                                filtered_count += 1;
+                                continue;
+                            }
+                            
                             let before = parser.decoded_packets().len();
                             let _ = parser.receive_packet(
                                 udp_packet.payload,
@@ -95,7 +113,7 @@ impl PacketSniffer {
                 }
             }
             
-            info!("Packet capture stopped");
+            info!("Packet capture stopped. Total: {}, Filtered: {}", packet_number, filtered_count);
         });
 
         Ok(())

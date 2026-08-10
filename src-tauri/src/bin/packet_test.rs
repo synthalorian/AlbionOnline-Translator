@@ -8,9 +8,9 @@ use albion_network_lib::{
 };
 
 fn main() {
-    println!("Albion Online Packet Sniffer Test - albion-network-lib");
-    println!("======================================================");
-    println!("Listening for chat messages...");
+    println!("Albion Online Packet Sniffer Test - Both Ports");
+    println!("==============================================");
+    println!("Capturing UDP ports 5055 AND 5056...");
     println!("Send a chat message NOW!");
     println!("Press Ctrl+C to stop\n");
 
@@ -35,21 +35,27 @@ fn main() {
         .open()
         .expect("Failed to start capture");
 
-    cap.filter("udp port 5056 or udp port 4535", true)
+    // Capture BOTH Albion ports
+    cap.filter("udp port 5055 or udp port 5056 or udp port 4535", true)
         .expect("Failed to set filter");
+
+    let link_type = cap.get_datalink().0;
+    println!("Link type: {}\n", link_type);
 
     let config = PhotonParserConfig::with_defaults("test".to_string(), false);
     let mut parser = PhotonParser::new(config);
     
     let mut packet_count = 0;
     let mut chat_count = 0;
+    let mut event_counts: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+    let mut op_counts: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
 
     while running.load(Ordering::SeqCst) {
         match cap.next_packet() {
             Ok(packet) => {
                 packet_count += 1;
                 
-                if let Some(udp_packet) = extract_udp_payload(packet.data, None) {
+                if let Some(udp_packet) = extract_udp_payload(packet.data, Some(link_type as u16)) {
                     let before = parser.decoded_packets().len();
                     let _ = parser.receive_packet(
                         udp_packet.payload,
@@ -59,29 +65,43 @@ fn main() {
                     );
                     
                     for decoded in &parser.decoded_packets()[before..] {
-                        if let DecodedPacket::Event(event) = decoded {
-                            if let Some(ExtractedPacket::ChatMessage(msg)) = &event.extracted {
-                                chat_count += 1;
-                                let json = serde_json::to_value(msg).unwrap_or_default();
-                                let player = json.get("player_name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("?");
-                                let channel = json.get("channel_type").and_then(|v| v.as_str()).unwrap_or("?");
+                        match decoded {
+                            DecodedPacket::Event(event) => {
+                                *event_counts.entry(event.code as i32).or_insert(0) += 1;
                                 
-                                println!("[CHAT] [{}] {}: {}", channel, player, message);
+                                if let Some(ExtractedPacket::ChatMessage(msg)) = &event.extracted {
+                                    chat_count += 1;
+                                    let json = serde_json::to_value(msg).unwrap_or_default();
+                                    let player = json.get("player_name").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let message = json.get("message").and_then(|v| v.as_str()).unwrap_or("?");
+                                    let channel = json.get("channel_type").and_then(|v| v.as_str()).unwrap_or("?");
+                                    
+                                    println!("[CHAT] [{}] {}: {}", channel, player, message);
+                                }
                             }
+                            DecodedPacket::Operation(op) => {
+                                *op_counts.entry(op.code as i32).or_insert(0) += 1;
+                                
+                                if op.code as i32 == 189 || op.code as i32 == 193 || op.code as i32 == 194 {
+                                    println!("[CHAT OP] Code {:?} detected!", op.code);
+                                }
+                            }
+                            DecodedPacket::Unknown(_) => {}
                         }
                     }
                 }
                 
-                if packet_count % 1000 == 0 {
-                    println!("Packets: {} | Chat messages: {}", packet_count, chat_count);
+                if packet_count % 100 == 0 {
+                    println!("Packets: {} | Chat: {} | Events: {:?} | Ops: {:?}", 
+                             packet_count, chat_count, event_counts, op_counts);
                 }
             }
             Err(_) => {}
         }
     }
 
-    println!("\n\nCapture stopped.");
-    println!("Total packets: {}", packet_count);
+    println!("\nTotal packets: {}", packet_count);
     println!("Chat messages: {}", chat_count);
+    println!("Event codes: {:?}", event_counts);
+    println!("Operation codes: {:?}", op_counts);
 }
