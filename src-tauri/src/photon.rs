@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, trace};
+use tracing::trace;
 
 /// Photon Unity Networking protocol decoder for Albion Online
 /// Based on reverse engineering from albion-online-addons and albion-translator
@@ -46,6 +46,7 @@ impl std::fmt::Display for ChatChannel {
 
 /// Photon packet types
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum PhotonPacketType {
     Init = 0,
     InitResponse = 1,
@@ -60,6 +61,7 @@ enum PhotonPacketType {
 
 /// Photon operation codes for Albion
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum AlbionOperation {
     // Chat operations
     ChatSay = 188,
