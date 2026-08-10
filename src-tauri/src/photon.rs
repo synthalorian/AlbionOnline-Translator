@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tracing::trace;
 
 /// Photon Unity Networking protocol decoder for Albion Online
-/// Based on reverse engineering from albion-online-addons and albion-translator
+/// Based on Protocol18 from albion-network-lib
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -25,6 +25,7 @@ pub enum ChatChannel {
     Global,
     Trade,
     LFG,
+    Faction,
     Unknown,
 }
 
@@ -39,78 +40,24 @@ impl std::fmt::Display for ChatChannel {
             ChatChannel::Global => write!(f, "Global"),
             ChatChannel::Trade => write!(f, "Trade"),
             ChatChannel::LFG => write!(f, "LFG"),
+            ChatChannel::Faction => write!(f, "Faction"),
             ChatChannel::Unknown => write!(f, "Unknown"),
         }
     }
 }
 
-/// Photon packet types
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-enum PhotonPacketType {
-    Init = 0,
-    InitResponse = 1,
-    Operation = 2,
-    OperationResponse = 3,
-    Event = 4,
-    InternalOperation = 6,
-    InternalOperationResponse = 7,
-    Message = 8,
-    RawMessage = 9,
-}
-
-/// Photon operation codes for Albion
-#[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)]
-enum AlbionOperation {
-    // Chat operations
-    ChatSay = 188,
-    ChatWhisper = 189,
-    ChatParty = 190,
-    ChatGuild = 191,
-    ChatAlliance = 192,
-    
-    // Event codes (server -> client)
-    EventChatMessage = 210,
-    EventChatMessage2 = 211,
-}
-
+/// Photon decoder with Protocol18 deserialization
 #[derive(Clone)]
 pub struct PhotonDecoder {
-    // Message definition cache
-    event_map: HashMap<u8, String>,
+    // Channel state tracking for chat channel mapping
+    channel_map: HashMap<i64, ChatChannel>,
 }
 
 impl PhotonDecoder {
     pub fn new() -> Self {
-        let mut event_map = HashMap::new();
-        // Populate from messages.json
-        event_map.insert(1, "Leave".to_string());
-        event_map.insert(6, "HealthUpdate".to_string());
-        event_map.insert(25, "NewCharacter".to_string());
-        event_map.insert(73, "UpdateFame".to_string());
-        event_map.insert(80, "CharacterEquipmentChanged".to_string());
-        event_map.insert(81, "RegenerationHealthChanged".to_string());
-        event_map.insert(154, "KnockedDown".to_string());
-        event_map.insert(188, "ChatSay".to_string());
-        event_map.insert(210, "ChatMessage".to_string());
-        event_map.insert(211, "ChatMessage2".to_string());
-        event_map.insert(214, "PartyInvitation".to_string());
-        event_map.insert(215, "PartyJoined".to_string());
-        event_map.insert(216, "PartyDisbanded".to_string());
-        event_map.insert(217, "PartyPlayerJoined".to_string());
-        event_map.insert(218, "PartyChangedOrder".to_string());
-        event_map.insert(219, "PartyPlayerLeft".to_string());
-        event_map.insert(220, "PartyLeaderChanged".to_string());
-        event_map.insert(221, "PartyLootSettingChangedPlayer".to_string());
-        event_map.insert(222, "PartySilverGained".to_string());
-        event_map.insert(223, "PartyPlayerUpdated".to_string());
-        event_map.insert(224, "PartyInvitationPlayerBusy".to_string());
-        event_map.insert(225, "PartyMarkedObjectsUpdated".to_string());
-        event_map.insert(226, "PartyOnClusterPartyJoined".to_string());
-        event_map.insert(227, "PartySetRoleFlag".to_string());
-
-        Self { event_map }
+        Self {
+            channel_map: HashMap::new(),
+        }
     }
 
     /// Decode a Photon UDP packet
@@ -121,11 +68,21 @@ impl PhotonDecoder {
         }
 
         // Photon header: peer_id (2) + crc_enabled (1) + command_count (1) + timestamp (4) + challenge (4)
-        // Then command header: type (1) + channel_id (1) + flags (1) + reserved (1) + length (4)
+        let flags = data[2];
+        let command_count = data[3];
         
-        let mut offset = 12; // Skip Photon header
+        // Skip encrypted packets
+        if flags == 1 {
+            return None;
+        }
+
+        let mut offset = 12;
         
-        while offset + 8 <= data.len() {
+        for _ in 0..command_count {
+            if offset + 12 > data.len() {
+                break;
+            }
+
             let cmd_type = data[offset];
             let _channel_id = data[offset + 1];
             let _flags = data[offset + 2];
@@ -135,16 +92,16 @@ impl PhotonDecoder {
                 data[offset + 6],
                 data[offset + 7],
             ]) as usize;
-            
-            if cmd_length < 8 || offset + cmd_length > data.len() {
+
+            if cmd_length < 12 || offset + cmd_length > data.len() {
                 break;
             }
 
-            let payload = &data[offset + 8..offset + cmd_length];
+            let payload = &data[offset + 12..offset + cmd_length];
             
-            // Check if this is an event packet
-            if cmd_type == PhotonPacketType::Event as u8 {
-                if let Some(msg) = self.decode_event(payload) {
+            // Check if this is a SendReliable or SendUnreliable command
+            if cmd_type == 6 || cmd_type == 7 {
+                if let Some(msg) = self.decode_message(payload) {
                     return Some(msg);
                 }
             }
@@ -155,95 +112,298 @@ impl PhotonDecoder {
         None
     }
 
-    fn decode_event(&self, data: &[u8]) -> Option<ChatMessage> {
-        if data.len() < 2 {
+    fn decode_message(&self, data: &[u8]) -> Option<ChatMessage> {
+        if data.is_empty() {
             return None;
         }
 
-        let event_code = data[0];
-        trace!("Event code: {} ({})", event_code, 
-               self.event_map.get(&event_code).unwrap_or(&"Unknown".to_string()));
+        // Photon message type
+        let msg_type = data[0];
+        
+        match msg_type {
+            2 => self.decode_operation_request(&data[1..]),
+            3 => self.decode_operation_response(&data[1..]),
+            4 => self.decode_event(&data[1..]),
+            _ => None,
+        }
+    }
 
-        // Chat message events
+    fn decode_operation_request(&self, _data: &[u8]) -> Option<ChatMessage> {
+        // Operation requests are client->server, we don't need them for chat display
+        None
+    }
+
+    fn decode_operation_response(&self, _data: &[u8]) -> Option<ChatMessage> {
+        // Operation responses are server->client, we don't need them for chat display
+        None
+    }
+
+    fn decode_event(&self, data: &[u8]) -> Option<ChatMessage> {
+        if data.is_empty() {
+            return None;
+        }
+
+        let event_code = data[0] as i32;
+        trace!("Event code: {}", event_code);
+
+        // Chat events (from albion-network-lib EventCode)
         match event_code {
-            210 | 211 => self.decode_chat_message(&data[1..]),
+            73 => self.decode_chat_message(&data[1..]), // ChatMessage
+            74 => self.decode_chat_say(&data[1..]),     // ChatSay
+            75 => self.decode_chat_whisper(&data[1..]), // ChatWhisper
             _ => None,
         }
     }
 
     fn decode_chat_message(&self, data: &[u8]) -> Option<ChatMessage> {
-        // Albion chat message structure (reverse engineered):
-        // - sender_name: string (2-byte length prefix + UTF-8)
-        // - channel_type: byte
-        // - message: string (2-byte length prefix + UTF-8)
+        // ChatMessage event structure (Protocol18):
+        // param 0: channel_id (compressed i64)
+        // param 1: player_name (string)
+        // param 2: message (string)
         
-        if data.len() < 3 {
-            return None;
-        }
-
-        let mut offset = 0;
+        let params = self.deserialize_parameter_table(data)?;
         
-        // Read sender name
-        let sender_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
+        let channel_id = params.get(&0)?.as_i64()?;
+        let player_name = params.get(&1)?.as_str()?.to_string();
+        let message = params.get(&2)?.as_str()?.to_string();
         
-        if offset + sender_len > data.len() {
-            return None;
-        }
+        let channel = self.map_channel(channel_id);
         
-        let sender = String::from_utf8_lossy(&data[offset..offset + sender_len]).to_string();
-        offset += sender_len;
-        
-        if offset >= data.len() {
-            return None;
-        }
-        
-        // Read channel type
-        let channel_byte = data[offset];
-        offset += 1;
-        
-        let channel = match channel_byte {
-            0 => ChatChannel::Say,
-            1 => ChatChannel::Whisper,
-            2 => ChatChannel::Party,
-            3 => ChatChannel::Guild,
-            4 => ChatChannel::Alliance,
-            5 => ChatChannel::Global,
-            6 => ChatChannel::Trade,
-            7 => ChatChannel::LFG,
-            _ => ChatChannel::Unknown,
-        };
-        
-        // Read message
-        if offset + 2 > data.len() {
-            return None;
-        }
-        
-        let msg_len = u16::from_be_bytes([data[offset], data[offset + 1]]) as usize;
-        offset += 2;
-        
-        if offset + msg_len > data.len() {
-            return None;
-        }
-        
-        let text = String::from_utf8_lossy(&data[offset..offset + msg_len]).to_string();
-        
-        // Skip empty messages
-        if text.trim().is_empty() {
-            return None;
-        }
-
         let now = chrono::Local::now();
         
         Some(ChatMessage {
             timestamp: now.format("%H:%M:%S").to_string(),
             channel,
-            sender,
-            text,
+            sender: player_name,
+            text: message,
             source_lang: None,
             translated_text: None,
         })
     }
+
+    fn decode_chat_say(&self, data: &[u8]) -> Option<ChatMessage> {
+        // ChatSay event structure:
+        // param 0: player_name (string)
+        // param 1: message (string)
+        
+        let params = self.deserialize_parameter_table(data)?;
+        
+        let player_name = params.get(&0)?.as_str()?.to_string();
+        let message = params.get(&1)?.as_str()?.to_string();
+        
+        let now = chrono::Local::now();
+        
+        Some(ChatMessage {
+            timestamp: now.format("%H:%M:%S").to_string(),
+            channel: ChatChannel::Say,
+            sender: player_name,
+            text: message,
+            source_lang: None,
+            translated_text: None,
+        })
+    }
+
+    fn decode_chat_whisper(&self, data: &[u8]) -> Option<ChatMessage> {
+        // ChatWhisper event structure:
+        // param 0: player_name (string)
+        // param 1: message (string)
+        
+        let params = self.deserialize_parameter_table(data)?;
+        
+        let player_name = params.get(&0)?.as_str()?.to_string();
+        let message = params.get(&1)?.as_str()?.to_string();
+        
+        let now = chrono::Local::now();
+        
+        Some(ChatMessage {
+            timestamp: now.format("%H:%M:%S").to_string(),
+            channel: ChatChannel::Whisper,
+            sender: player_name,
+            text: message,
+            source_lang: None,
+            translated_text: None,
+        })
+    }
+
+    fn map_channel(&self, channel_id: i64) -> ChatChannel {
+        // From albion-network-lib ChatChannel mapping
+        match channel_id {
+            0 => ChatChannel::Say,
+            3517 => ChatChannel::Guild,
+            1868 => ChatChannel::Faction, // Thetford
+            1856 => ChatChannel::Faction, // Martlock
+            1857 => ChatChannel::Faction, // Bridgewatch
+            1858 => ChatChannel::Faction, // Lymhurst
+            1859 => ChatChannel::Faction, // Fort Sterling
+            1860 => ChatChannel::Faction, // Caerleon
+            _ => ChatChannel::Unknown,
+        }
+    }
+
+    /// Protocol18 parameter table deserialization
+    fn deserialize_parameter_table(&self, data: &[u8]) -> Option<HashMap<u8, serde_json::Value>> {
+        let mut reader = Reader::new(data);
+        let size = reader.read_u8()?;
+        
+        let mut params = HashMap::new();
+        for _ in 0..size {
+            let key = reader.read_u8()?;
+            let value_type = reader.read_u8()?;
+            let value = self.deserialize_value(&mut reader, value_type)?;
+            params.insert(key, value);
+        }
+        
+        Some(params)
+    }
+
+    fn deserialize_value(&self, reader: &mut Reader, type_code: u8) -> Option<serde_json::Value> {
+        match type_code {
+            0 | 8 => Some(serde_json::Value::Null),
+            2 => Some(serde_json::Value::Bool(reader.read_u8()? != 0)),
+            3 => Some(serde_json::json!(reader.read_u8()?)),
+            4 => Some(serde_json::json!(reader.read_i16_le()?)),
+            5 => Some(serde_json::json!(reader.read_f32_le()?)),
+            6 => Some(serde_json::json!(reader.read_f64_le()?)),
+            7 => {
+                let len = self.read_count(reader)?;
+                let bytes = reader.read_bytes(len)?;
+                Some(serde_json::Value::String(String::from_utf8_lossy(bytes).to_string()))
+            }
+            9 => Some(serde_json::json!(self.read_compressed_i32(reader)?)),
+            10 => Some(serde_json::json!(self.read_compressed_i64(reader)?)),
+            11 => Some(serde_json::json!(reader.read_u8()?)),
+            12 => Some(serde_json::json!(-(reader.read_u8()? as i32))),
+            13 => Some(serde_json::json!(reader.read_u16_le()?)),
+            14 => Some(serde_json::json!(-(reader.read_u16_le()? as i32))),
+            15 => Some(serde_json::json!(reader.read_u8()?)),
+            16 => Some(serde_json::json!(-(reader.read_u8()? as i64))),
+            17 => Some(serde_json::json!(reader.read_u16_le()?)),
+            18 => Some(serde_json::json!(-(reader.read_u16_le()? as i64))),
+            27 => Some(serde_json::Value::Bool(false)),
+            28 => Some(serde_json::Value::Bool(true)),
+            _ => None,
+        }
+    }
+
+    fn read_count(&self, reader: &mut Reader) -> Option<usize> {
+        Some(self.read_compressed_u32(reader)? as usize)
+    }
+
+    fn read_compressed_u32(&self, reader: &mut Reader) -> Option<u32> {
+        let mut value = 0u32;
+        let mut shift = 0;
+        while shift < 35 {
+            let current = reader.read_u8()? as u32;
+            value |= (current & 0x7f) << shift;
+            if (current & 0x80) == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+        None
+    }
+
+    fn read_compressed_u64(&self, reader: &mut Reader) -> Option<u64> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        while shift < 70 {
+            let current = reader.read_u8()? as u64;
+            value |= (current & 0x7f) << shift;
+            if (current & 0x80) == 0 {
+                return Some(value);
+            }
+            shift += 7;
+        }
+        None
+    }
+
+    fn read_compressed_i32(&self, reader: &mut Reader) -> Option<i32> {
+        let value = self.read_compressed_u32(reader)?;
+        Some(((value >> 1) as i32) ^ -((value & 1) as i32))
+    }
+
+    fn read_compressed_i64(&self, reader: &mut Reader) -> Option<i64> {
+        let value = self.read_compressed_u64(reader)?;
+        Some(((value >> 1) as i64) ^ -((value & 1) as i64))
+    }
 }
 
-// Add chrono to Cargo.toml dependencies
+/// Simple byte reader for Protocol18
+struct Reader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self { data, pos: 0 }
+    }
+
+    fn read_u8(&mut self) -> Option<u8> {
+        if self.pos >= self.data.len() {
+            return None;
+        }
+        let value = self.data[self.pos];
+        self.pos += 1;
+        Some(value)
+    }
+
+    fn read_i16_le(&mut self) -> Option<i16> {
+        if self.pos + 2 > self.data.len() {
+            return None;
+        }
+        let value = i16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Some(value)
+    }
+
+    fn read_u16_le(&mut self) -> Option<u16> {
+        if self.pos + 2 > self.data.len() {
+            return None;
+        }
+        let value = u16::from_le_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Some(value)
+    }
+
+    fn read_f32_le(&mut self) -> Option<f32> {
+        if self.pos + 4 > self.data.len() {
+            return None;
+        }
+        let value = f32::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Some(value)
+    }
+
+    fn read_f64_le(&mut self) -> Option<f64> {
+        if self.pos + 8 > self.data.len() {
+            return None;
+        }
+        let value = f64::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+            self.data[self.pos + 4],
+            self.data[self.pos + 5],
+            self.data[self.pos + 6],
+            self.data[self.pos + 7],
+        ]);
+        self.pos += 8;
+        Some(value)
+    }
+
+    fn read_bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+        if self.pos + len > self.data.len() {
+            return None;
+        }
+        let bytes = &self.data[self.pos..self.pos + len];
+        self.pos += len;
+        Some(bytes)
+    }
+}

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::photon::{ChatMessage, PhotonDecoder};
+use crate::translator::TranslationEngine;
 
 const ALBION_PORT: u16 = 5056;
 
@@ -52,11 +53,22 @@ impl PacketSniffer {
 
         tokio::spawn(async move {
             info!("Packet capture started on port {}", ALBION_PORT);
+            let mut translator = TranslationEngine::new();
             
             while running.load(Ordering::SeqCst) {
                 match cap.next_packet() {
                     Ok(packet) => {
-                        if let Some(msg) = Self::process_packet(&packet, &decoder) {
+                        if let Some(mut msg) = Self::process_packet(&packet, &decoder) {
+                            // Detect language
+                            msg.source_lang = translator.detect_language(&msg.text);
+                            
+                            // Translate if not already in target language
+                            if let Some(ref src) = msg.source_lang {
+                                if src != translator.target_language() {
+                                    msg.translated_text = translator.translate(&msg.text, Some(src)).await;
+                                }
+                            }
+                            
                             if tx.send(msg).await.is_err() {
                                 error!("Failed to send chat message to channel");
                                 break;
@@ -87,7 +99,6 @@ impl PacketSniffer {
 
     fn process_packet(packet: &Packet, decoder: &PhotonDecoder) -> Option<ChatMessage> {
         // Skip Ethernet header (14 bytes) + IP header (20 bytes min) + UDP header (8 bytes)
-        // This is a simplified approach - real implementation needs proper IP header parsing
         let data = packet.data;
         
         if data.len() < 42 {
