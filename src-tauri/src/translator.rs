@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tracing::{debug, info};
+use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 
 /// Translation engine with pluggable backends
-/// Supports: Google Translate API, local detection, caching
+/// Supports: Google Translate API, lingua-rs detection, caching
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationRequest {
@@ -42,17 +43,39 @@ pub struct TranslationEngine {
     cache: HashMap<String, String>,
     google_api_key: Option<String>,
     http_client: reqwest::Client,
+    detector: LanguageDetector,
 }
 
 impl TranslationEngine {
     pub fn new() -> Self {
         let google_api_key = std::env::var("GOOGLE_TRANSLATE_API_KEY").ok();
         
+        // Build lingua detector with common Albion languages
+        let languages = vec![
+            Language::English,
+            Language::Spanish,
+            Language::Portuguese,
+            Language::French,
+            Language::German,
+            Language::Russian,
+            Language::Chinese,
+            Language::Japanese,
+            Language::Korean,
+            Language::Turkish,
+            Language::Arabic,
+            Language::Thai,
+        ];
+        
+        let detector = LanguageDetectorBuilder::from_languages(&languages)
+            .with_minimum_relative_distance(0.25)
+            .build();
+        
         Self {
             target_language: "en".to_string(),
             cache: HashMap::new(),
             google_api_key,
             http_client: reqwest::Client::new(),
+            detector,
         }
     }
 
@@ -73,15 +96,24 @@ impl TranslationEngine {
             return None;
         }
 
-        // Skip if already in target language (simple heuristic)
-        if let Some(detected) = self.detect_language(trimmed) {
-            if detected == self.target_language {
+        // Skip URLs, mentions, and pure emoji
+        if trimmed.starts_with("http") || trimmed.starts_with("@") {
+            return None;
+        }
+
+        // Detect language if not provided
+        let detected = source_lang.map(|s| s.to_string())
+            .or_else(|| self.detect_language(trimmed));
+
+        // Skip if already in target language
+        if let Some(ref det) = detected {
+            if det == &self.target_language {
                 return None;
             }
         }
 
         let cache_key = format!("{}:{}:{}", 
-            source_lang.unwrap_or("auto"), 
+            detected.as_deref().unwrap_or("auto"), 
             self.target_language,
             trimmed
         );
@@ -105,8 +137,8 @@ impl TranslationEngine {
         }
 
         // Fallback: return original with language tag
-        let detected = self.detect_language(trimmed).unwrap_or_else(|| "unknown".to_string());
-        let fallback = format!("[{}] {}", detected, trimmed);
+        let lang_tag = detected.unwrap_or_else(|| "unknown".to_string());
+        let fallback = format!("[{}] {}", lang_tag, trimmed);
         self.cache.insert(cache_key, fallback.clone());
         Some(fallback)
     }
@@ -139,77 +171,30 @@ impl TranslationEngine {
             .unwrap_or_else(|| text.to_string()))
     }
 
-    /// Detect language of text using character heuristics
-    /// TODO: Replace with lingua-rs for proper detection
+    /// Detect language using lingua-rs
     pub fn detect_language(&self, text: &str) -> Option<String> {
-        if text.is_empty() {
+        if text.is_empty() || text.len() < 3 {
             return None;
         }
 
-        let mut scores: HashMap<&str, usize> = HashMap::new();
+        let detected = self.detector.detect_language_of(text)?;
         
-        for c in text.chars() {
-            let code = c as u32;
-            
-            // Chinese (CJK Unified Ideographs)
-            if (0x4E00..=0x9FFF).contains(&code) {
-                *scores.entry("zh").or_insert(0) += 2;
-            }
-            // Japanese (Hiragana, Katakana)
-            else if (0x3040..=0x309F).contains(&code) || (0x30A0..=0x30FF).contains(&code) {
-                *scores.entry("ja").or_insert(0) += 2;
-            }
-            // Korean (Hangul)
-            else if (0xAC00..=0xD7AF).contains(&code) || (0x1100..=0x11FF).contains(&code) {
-                *scores.entry("ko").or_insert(0) += 2;
-            }
-            // Russian (Cyrillic)
-            else if (0x0400..=0x04FF).contains(&code) {
-                *scores.entry("ru").or_insert(0) += 2;
-            }
-            // Arabic
-            else if (0x0600..=0x06FF).contains(&code) {
-                *scores.entry("ar").or_insert(0) += 2;
-            }
-            // Thai
-            else if (0x0E00..=0x0E7F).contains(&code) {
-                *scores.entry("th").or_insert(0) += 2;
-            }
-            // Portuguese specific
-            else if "ãõç".contains(c) {
-                *scores.entry("pt").or_insert(0) += 1;
-            }
-            // Spanish specific
-            else if "ñ¿¡".contains(c) {
-                *scores.entry("es").or_insert(0) += 1;
-            }
-            // French specific
-            else if "àâäçéèêëîïôöùûüÿ".contains(c) {
-                *scores.entry("fr").or_insert(0) += 1;
-            }
-            // German specific
-            else if "äöüß".contains(c) {
-                *scores.entry("de").or_insert(0) += 1;
-            }
-            // Turkish specific
-            else if "ğışç".contains(c) {
-                *scores.entry("tr").or_insert(0) += 1;
-            }
-        }
-
-        // Find highest scoring language
-        let mut best: Option<(&str, usize)> = None;
-        for (lang, score) in &scores {
-            if *score >= 2 {
-                match best {
-                    None => best = Some((lang, *score)),
-                    Some((_, best_score)) if *score > best_score => best = Some((lang, *score)),
-                    _ => {}
-                }
-            }
-        }
-
-        best.map(|(lang, _)| lang.to_string())
-            .or_else(|| Some("en".to_string()))
+        let code = match detected {
+            Language::English => "en",
+            Language::Spanish => "es",
+            Language::Portuguese => "pt",
+            Language::French => "fr",
+            Language::German => "de",
+            Language::Russian => "ru",
+            Language::Chinese => "zh",
+            Language::Japanese => "ja",
+            Language::Korean => "ko",
+            Language::Turkish => "tr",
+            Language::Arabic => "ar",
+            Language::Thai => "th",
+            _ => "unknown",
+        };
+        
+        Some(code.to_string())
     }
 }
