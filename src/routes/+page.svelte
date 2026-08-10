@@ -3,14 +3,15 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
   import { themes, themeCategories, applyTheme, getStoredTheme } from "$lib/themes.js";
+  import { loadSettings, saveSettings, applySettings } from "$lib/settings.js";
 
+  let settings = $state(loadSettings());
   let isCapturing = $state(false);
-  let targetLang = $state("en");
   let messages = $state([]);
   let unlisten = null;
-  let maxMessages = 100;
-  let currentTheme = $state(getStoredTheme());
+  let currentTheme = $state(settings.theme || getStoredTheme());
   let showThemePicker = $state(false);
+  let showSettings = $state(false);
 
   const languages = [
     { code: "en", name: "English" },
@@ -26,21 +27,19 @@
   ];
 
   onMount(async () => {
-    // Apply stored theme
     applyTheme(currentTheme);
+    applySettings(settings);
 
-    // Load initial state
     try {
       isCapturing = await invoke("get_capture_status");
-      targetLang = await invoke("get_target_language");
+      settings.targetLanguage = await invoke("get_target_language");
     } catch (e) {
       console.error("Failed to load state:", e);
     }
 
-    // Listen for chat messages
     unlisten = await listen("chat-message", (event) => {
       const msg = event.payload;
-      messages = [...messages.slice(-maxMessages + 1), msg];
+      messages = [...messages.slice(-settings.maxMessages + 1), msg];
     });
   });
 
@@ -65,7 +64,8 @@
 
   async function changeLanguage() {
     try {
-      await invoke("set_target_language", { lang: targetLang });
+      await invoke("set_target_language", { lang: settings.targetLanguage });
+      saveSettings(settings);
     } catch (e) {
       console.error("Language change failed:", e);
     }
@@ -77,8 +77,15 @@
 
   function selectTheme(themeId) {
     currentTheme = themeId;
+    settings.theme = themeId;
     applyTheme(themeId);
+    saveSettings(settings);
     showThemePicker = false;
+  }
+
+  function updateSettings() {
+    applySettings(settings);
+    saveSettings(settings);
   }
 
   function getChannelColor(channel) {
@@ -98,7 +105,7 @@
   }
 </script>
 
-<main class="overlay-container">
+<main class="overlay-container" style="opacity: {settings.opacity}">
   <!-- Title bar -->
   <div class="title-bar">
     <div class="title">
@@ -106,7 +113,10 @@
       <span>Albion Translator</span>
     </div>
     <div class="controls">
-      <button class="btn-icon" onclick={() => showThemePicker = !showThemePicker} title="Themes">
+      <button class="btn-icon" onclick={() => { showSettings = !showSettings; showThemePicker = false; }} title="Settings">
+        ⚙️
+      </button>
+      <button class="btn-icon" onclick={() => { showThemePicker = !showThemePicker; showSettings = false; }} title="Themes">
         🎨
       </button>
       <button class="btn-icon" onclick={clearMessages} title="Clear">🗑️</button>
@@ -119,6 +129,82 @@
       </button>
     </div>
   </div>
+
+  <!-- Settings panel -->
+  {#if showSettings}
+    <div class="settings-panel">
+      <div class="settings-header">
+        <span>Settings</span>
+        <button class="btn-icon" onclick={() => showSettings = false}>✕</button>
+      </div>
+      
+      <div class="setting-group">
+        <label>
+          <span>Opacity</span>
+          <span class="setting-value">{Math.round(settings.opacity * 100)}%</span>
+        </label>
+        <input 
+          type="range" 
+          min="0.3" 
+          max="1" 
+          step="0.05" 
+          bind:value={settings.opacity}
+          oninput={updateSettings}
+        />
+      </div>
+
+      <div class="setting-group">
+        <label>
+          <span>Font Size</span>
+          <span class="setting-value">{settings.fontSize}px</span>
+        </label>
+        <input 
+          type="range" 
+          min="10" 
+          max="20" 
+          step="1" 
+          bind:value={settings.fontSize}
+          oninput={updateSettings}
+        />
+      </div>
+
+      <div class="setting-group">
+        <label>
+          <span>Max Messages</span>
+          <span class="setting-value">{settings.maxMessages}</span>
+        </label>
+        <input 
+          type="range" 
+          min="10" 
+          max="500" 
+          step="10" 
+          bind:value={settings.maxMessages}
+          oninput={updateSettings}
+        />
+      </div>
+
+      <div class="setting-row">
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={settings.showTimestamps} onchange={updateSettings} />
+          <span>Show Timestamps</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={settings.showOriginal} onchange={updateSettings} />
+          <span>Show Original</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={settings.showTranslated} onchange={updateSettings} />
+          <span>Show Translated</span>
+        </label>
+      </div>
+    </div>
+  {/if}
 
   <!-- Theme picker dropdown -->
   {#if showThemePicker}
@@ -151,7 +237,7 @@
     <span class="status {isCapturing ? 'online' : 'offline'}">
       {isCapturing ? "● CAPTURING" : "○ IDLE"}
     </span>
-    <select bind:value={targetLang} onchange={changeLanguage} class="lang-select">
+    <select bind:value={settings.targetLanguage} onchange={changeLanguage} class="lang-select">
       {#each languages as lang}
         <option value={lang.code}>{lang.name}</option>
       {/each}
@@ -159,7 +245,7 @@
   </div>
 
   <!-- Chat messages -->
-  <div class="chat-container">
+  <div class="chat-container" style="font-size: {settings.fontSize}px">
     {#if messages.length === 0}
       <div class="empty-state">
         <p>No messages yet</p>
@@ -169,18 +255,22 @@
       {#each messages as msg}
         <div class="message" style="border-left-color: {getChannelColor(msg.channel)}">
           <div class="message-header">
-            <span class="timestamp">{msg.timestamp}</span>
+            {#if settings.showTimestamps}
+              <span class="timestamp">{msg.timestamp}</span>
+            {/if}
             <span class="channel" style="color: {getChannelColor(msg.channel)}">
               [{msg.channel}]
             </span>
             <span class="sender">{msg.sender}</span>
-            {#if msg.source_lang && msg.source_lang !== targetLang}
+            {#if msg.source_lang && msg.source_lang !== settings.targetLanguage}
               <span class="lang-badge">{msg.source_lang}</span>
             {/if}
           </div>
           <div class="message-body">
-            <p class="original">{msg.text}</p>
-            {#if msg.translated_text && msg.translated_text !== msg.text}
+            {#if settings.showOriginal}
+              <p class="original">{msg.text}</p>
+            {/if}
+            {#if settings.showTranslated && msg.translated_text && msg.translated_text !== msg.text}
               <p class="translated">{msg.translated_text}</p>
             {/if}
           </div>
@@ -270,6 +360,88 @@
   .btn-icon.active {
     background: rgba(255, 80, 80, 0.3);
     border-color: rgba(255, 80, 80, 0.5);
+  }
+
+  /* Settings panel */
+  .settings-panel {
+    position: absolute;
+    top: 50px;
+    right: 10px;
+    width: 260px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 14px;
+    z-index: 100;
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  }
+
+  .settings-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 14px;
+    font-weight: 600;
+    font-size: 14px;
+    color: var(--accent-primary);
+  }
+
+  .setting-group {
+    margin-bottom: 14px;
+  }
+
+  .setting-group label {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .setting-value {
+    color: var(--accent-primary);
+    font-weight: 600;
+    font-family: "Consolas", monospace;
+  }
+
+  .setting-group input[type="range"] {
+    width: 100%;
+    height: 6px;
+    -webkit-appearance: none;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    outline: none;
+  }
+
+  .setting-group input[type="range"]::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 16px;
+    height: 16px;
+    background: var(--accent-primary);
+    border-radius: 50%;
+    cursor: pointer;
+    box-shadow: 0 0 6px var(--accent-glow);
+  }
+
+  .setting-row {
+    margin-bottom: 10px;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+
+  .checkbox-label input[type="checkbox"] {
+    width: 16px;
+    height: 16px;
+    accent-color: var(--accent-primary);
+    cursor: pointer;
   }
 
   /* Theme picker */
@@ -486,7 +658,6 @@
   }
 
   .message-body {
-    font-size: 13px;
     line-height: 1.4;
   }
 

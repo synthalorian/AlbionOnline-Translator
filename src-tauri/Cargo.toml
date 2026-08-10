@@ -25,4 +25,5 @@ chrono = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+lingua = { version = "1.8.0", features = ["chinese", "japanese", "korean", "russian", "arabic", "thai", "portuguese", "spanish", "french", "german", "turkish", "english"] }
 
