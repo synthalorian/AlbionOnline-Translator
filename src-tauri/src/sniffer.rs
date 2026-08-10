@@ -1,26 +1,27 @@
-use pcap::{Capture, Device, Packet};
+use pcap::{Capture, Device};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::photon::{ChatMessage, PhotonDecoder};
-use crate::translator::TranslationEngine;
+use albion_network_lib::{
+    DecodedPacket, ExtractedPacket, PhotonParser, PhotonParserConfig,
+    extract_udp_payload,
+};
 
-const ALBION_PORT: u16 = 5056;
+use crate::photon::{ChatMessage as UiChatMessage, ChatChannel as UiChatChannel};
+use crate::translator::TranslationEngine;
 
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
-    tx: mpsc::Sender<ChatMessage>,
-    decoder: PhotonDecoder,
+    tx: mpsc::Sender<UiChatMessage>,
 }
 
 impl PacketSniffer {
-    pub fn new(tx: mpsc::Sender<ChatMessage>) -> Self {
+    pub fn new(tx: mpsc::Sender<UiChatMessage>) -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             tx,
-            decoder: PhotonDecoder::new(),
         }
     }
 
@@ -43,41 +44,52 @@ impl PacketSniffer {
             .open()
             .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
 
-        cap.filter(&format!("udp port {}", ALBION_PORT), true)
+        cap.filter("udp port 5056 or udp port 4535", true)
             .map_err(|e| SnifferError::Filter(e.to_string()))?;
 
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tx = self.tx.clone();
-        let decoder = self.decoder.clone();
 
         tokio::spawn(async move {
-            info!("Packet capture started on port {}", ALBION_PORT);
+            info!("Packet capture started");
+            
+            let config = PhotonParserConfig::with_defaults("live".to_string(), false);
+            let mut parser = PhotonParser::new(config);
             let mut translator = TranslationEngine::new();
+            let mut packet_number = 0usize;
             
             while running.load(Ordering::SeqCst) {
                 match cap.next_packet() {
                     Ok(packet) => {
-                        if let Some(mut msg) = Self::process_packet(&packet, &decoder) {
-                            // Detect language
-                            msg.source_lang = translator.detect_language(&msg.text);
+                        packet_number += 1;
+                        
+                        if let Some(udp_packet) = extract_udp_payload(packet.data, None) {
+                            let before = parser.decoded_packets().len();
+                            let _ = parser.receive_packet(
+                                udp_packet.payload,
+                                packet_number,
+                                udp_packet.source,
+                                udp_packet.destination,
+                            );
                             
-                            // Translate if not already in target language
-                            if let Some(ref src) = msg.source_lang {
-                                if src != translator.target_language() {
-                                    msg.translated_text = translator.translate(&msg.text, Some(src)).await;
+                            // Process newly decoded packets
+                            for decoded in &parser.decoded_packets()[before..] {
+                                if let DecodedPacket::Event(event) = decoded {
+                                    if let Some(ExtractedPacket::ChatMessage(_)) = &event.extracted {
+                                        let ui_msg = Self::convert_message(&event.extracted, &mut translator).await;
+                                        if tx.send(ui_msg).await.is_err() {
+                                            error!("Failed to send chat message");
+                                            break;
+                                        }
+                                    }
                                 }
-                            }
-                            
-                            if tx.send(msg).await.is_err() {
-                                error!("Failed to send chat message to channel");
-                                break;
                             }
                         }
                     }
                     Err(e) => {
                         if running.load(Ordering::SeqCst) {
-                            debug!("Packet capture timeout or error: {}", e);
+                            debug!("Capture timeout: {}", e);
                         }
                     }
                 }
@@ -97,19 +109,62 @@ impl PacketSniffer {
         self.running.load(Ordering::SeqCst)
     }
 
-    fn process_packet(packet: &Packet, decoder: &PhotonDecoder) -> Option<ChatMessage> {
-        // Skip Ethernet header (14 bytes) + IP header (20 bytes min) + UDP header (8 bytes)
-        let data = packet.data;
+    async fn convert_message(extracted: &Option<ExtractedPacket>, translator: &mut TranslationEngine) -> UiChatMessage {
+        let now = chrono::Local::now();
         
-        if data.len() < 42 {
-            return None;
+        // Serialize to JSON to extract fields
+        let json = serde_json::to_value(extracted).unwrap_or_default();
+        
+        let player_name = json.get("player_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown")
+            .to_string();
+        
+        let message = json.get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        
+        let channel_type = json.get("channel_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unknown");
+        
+        // Detect language
+        let source_lang = translator.detect_language(&message);
+        
+        // Translate if needed
+        let translated_text = if let Some(ref src) = source_lang {
+            if src != translator.target_language() {
+                translator.translate(&message, Some(src)).await
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        UiChatMessage {
+            timestamp: now.format("%H:%M:%S").to_string(),
+            channel: Self::map_channel(channel_type),
+            sender: player_name,
+            text: message,
+            source_lang,
+            translated_text,
         }
+    }
 
-        // Extract UDP payload (simplified - assumes no IP options)
-        let udp_payload = &data[42..];
-        
-        // Decode Photon packet
-        decoder.decode(udp_payload)
+    fn map_channel(channel: &str) -> UiChatChannel {
+        match channel {
+            "Say" | "Local" => UiChatChannel::Say,
+            "Guild" => UiChatChannel::Guild,
+            "Faction" => UiChatChannel::Faction,
+            "Whisper" => UiChatChannel::Whisper,
+            "Party" => UiChatChannel::Party,
+            "Alliance" => UiChatChannel::Alliance,
+            "Global" => UiChatChannel::Global,
+            "Trade" => UiChatChannel::Trade,
+            _ => UiChatChannel::Unknown,
+        }
     }
 }
 
