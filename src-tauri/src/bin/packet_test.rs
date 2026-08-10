@@ -2,17 +2,14 @@ use pcap::{Capture, Device};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-// Photon message types (from albion-network-lib)
-const MESSAGE_OPERATION_REQUEST: u8 = 2;
 const MESSAGE_OPERATION_RESPONSE: u8 = 3;
 const MESSAGE_EVENT: u8 = 4;
-const MESSAGE_ENCRYPTED: u8 = 131;
 
 fn main() {
-    println!("Albion Online Packet Sniffer Test - Fixed Protocol");
-    println!("==================================================");
+    println!("Albion Online Packet Sniffer Test - Events + Operations");
+    println!("=======================================================");
     println!("Listening on UDP ports 5056 and 4535...");
-    println!("Make sure Albion Online is running and IN A CITY with chat active!");
+    println!("TYPE SOMETHING IN CHAT or join a busy city!");
     println!("Press Ctrl+C to stop\n");
 
     let running = Arc::new(AtomicBool::new(true));
@@ -40,8 +37,8 @@ fn main() {
         .expect("Failed to set filter");
 
     let mut packet_count = 0;
-    let mut chat_count = 0;
     let mut event_counts = std::collections::HashMap::new();
+    let mut op_counts = std::collections::HashMap::new();
 
     while running.load(Ordering::SeqCst) {
         match cap.next_packet() {
@@ -60,7 +57,7 @@ fn main() {
                     let cmd_count = payload[3];
                     
                     if flags == 1 {
-                        continue; // Skip encrypted
+                        continue;
                     }
                     
                     let mut offset = 12;
@@ -81,20 +78,28 @@ fn main() {
                             break;
                         }
                         
-                        // Check for SendReliable/SendUnreliable
                         if (cmd_type == 6 || cmd_type == 7) && cmd_len > 14 {
-                            // Photon message: first byte is unknown, second byte is message type
                             let msg_type = payload[offset + 13];
                             
-                            if msg_type == MESSAGE_EVENT {
-                                let event_code = payload[offset + 14];
-                                *event_counts.entry(event_code).or_insert(0) += 1;
-                                
-                                // Chat events: 73=ChatMessage, 74=ChatSay, 75=ChatWhisper
-                                if event_code == 73 || event_code == 74 || event_code == 75 {
-                                    chat_count += 1;
-                                    println!("[CHAT] Event {} detected! (packet #{})", event_code, packet_count);
+                            match msg_type {
+                                MESSAGE_EVENT => {
+                                    let event_code = payload[offset + 14];
+                                    *event_counts.entry(event_code).or_insert(0) += 1;
+                                    
+                                    if event_code == 73 || event_code == 74 || event_code == 75 {
+                                        println!("[CHAT EVENT] Code {} detected!", event_code);
+                                    }
                                 }
+                                MESSAGE_OPERATION_RESPONSE => {
+                                    let op_code = payload[offset + 14];
+                                    *op_counts.entry(op_code).or_insert(0) += 1;
+                                    
+                                    // Chat-related operations
+                                    if op_code == 188 || op_code == 189 || op_code == 190 {
+                                        println!("[CHAT OP] Code {} detected!", op_code);
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                         
@@ -102,9 +107,9 @@ fn main() {
                     }
                 }
                 
-                if packet_count % 500 == 0 {
-                    println!("Packets: {} | Chat: {} | Events: {:?}", 
-                             packet_count, chat_count, event_counts);
+                if packet_count % 1000 == 0 {
+                    println!("Packets: {} | Events: {:?} | Ops: {:?}", 
+                             packet_count, event_counts, op_counts);
                 }
             }
             Err(_) => {}
@@ -113,6 +118,6 @@ fn main() {
 
     println!("\n\nCapture stopped.");
     println!("Total packets: {}", packet_count);
-    println!("Chat messages detected: {}", chat_count);
-    println!("Event code distribution: {:?}", event_counts);
+    println!("Event codes: {:?}", event_counts);
+    println!("Operation codes: {:?}", op_counts);
 }
