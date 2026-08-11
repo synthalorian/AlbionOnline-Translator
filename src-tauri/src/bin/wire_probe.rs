@@ -88,7 +88,16 @@ fn main() {
                     for b in chunk {
                         print!("{:02x} ", b);
                     }
-                    println!();
+                    // pad short chunks so ascii column aligns
+                    for _ in chunk.len()..16 {
+                        print!("   ");
+                    }
+                    print!(" |");
+                    for b in chunk {
+                        let c = *b as char;
+                        print!("{}", if c.is_ascii_graphic() || c == ' ' { c } else { '.' });
+                    }
+                    println!("|");
                 }
             }
             Err(_) => {}

@@ -1,6 +1,7 @@
 [package]
 name = "albion-translator"
 version = "0.1.0"
+default-run = "albion-translator"
 description = "Albion Online chat translator overlay"
 authors = ["synth"]
 edition = "2021"
