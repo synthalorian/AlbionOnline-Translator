@@ -62,6 +62,22 @@
     license = s;
   }
 
+  const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "Trade", "LFG", "Faction", "Unknown"];
+
+  function toggleChannelFilter(channel) {
+    settings.channelFilters[channel] = !settings.channelFilters[channel];
+    saveSettings(settings);
+  }
+
+  function setAllChannelFilters(on) {
+    for (const ch of FILTER_CHANNELS) settings.channelFilters[ch] = on;
+    saveSettings(settings);
+  }
+
+  function visibleMessages(list) {
+    return list.filter((m) => settings.channelFilters[m.channel] !== false);
+  }
+
   async function toggleCapture() {
     try {
       if (isCapturing) {
@@ -264,15 +280,31 @@
     </select>
   </div>
 
+  <!-- Channel filter bar -->
+  <div class="filter-bar">
+    {#each FILTER_CHANNELS as ch}
+      <button
+        class="chip {settings.channelFilters[ch] !== false ? 'on' : 'off'}"
+        style="--chip-color: {getChannelColor(ch)}"
+        onclick={() => toggleChannelFilter(ch)}
+        title="{settings.channelFilters[ch] !== false ? 'Hide' : 'Show'} {ch} chat"
+      >
+        {ch}
+      </button>
+    {/each}
+    <button class="chip util" onclick={() => setAllChannelFilters(true)} title="Show all channels">All</button>
+    <button class="chip util" onclick={() => setAllChannelFilters(false)} title="Hide all channels">None</button>
+  </div>
+
   <!-- Chat messages -->
   <div class="chat-container" style="font-size: {settings.fontSize}px">
-    {#if messages.length === 0}
+    {#if visibleMessages(messages).length === 0}
       <div class="empty-state">
-        <p>No messages yet</p>
-        <p class="hint">Start capture and chat in Albion to see translations</p>
+        <p>{messages.length === 0 ? "No messages yet" : "All messages filtered out"}</p>
+        <p class="hint">{messages.length === 0 ? "Start capture and chat in Albion to see translations" : "Enable channels in the filter bar above"}</p>
       </div>
     {:else}
-      {#each messages as msg}
+      {#each visibleMessages(messages) as msg}
         <div class="message" style="border-left-color: {getChannelColor(msg.channel)}">
           <div class="message-header">
             {#if settings.showTimestamps}
@@ -580,6 +612,46 @@
 
   .lang-select:focus {
     border-color: var(--border-glow);
+  }
+
+  .filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+  }
+
+  .chip {
+    border: 1px solid var(--chip-color, var(--border-color));
+    background: transparent;
+    color: var(--chip-color, var(--text-muted));
+    border-radius: 10px;
+    padding: 2px 8px;
+    font-size: 10px;
+    font-weight: 600;
+    cursor: pointer;
+    opacity: 1;
+    transition: opacity 0.15s, background 0.15s;
+  }
+
+  .chip.on {
+    background: var(--chip-color, var(--accent-primary));
+    color: var(--bg-primary);
+  }
+
+  .chip.off {
+    opacity: 0.35;
+  }
+
+  .chip.util {
+    border-color: var(--border-color);
+    color: var(--text-muted);
+  }
+
+  .chip.util:hover {
+    color: var(--text-primary);
   }
 
   .chat-container {
