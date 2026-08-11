@@ -11,6 +11,19 @@ const defaultSettings = {
   alwaysOnTop: true,
   theme: 'synthwave-84',
   targetLanguage: 'en',
+  // Per-channel visibility toggles — every Albion chat channel, all on by default
+  channelFilters: {
+    Say: true,
+    Whisper: true,
+    Party: true,
+    Guild: true,
+    Alliance: true,
+    Global: true,
+    Trade: true,
+    LFG: true,
+    Faction: true,
+    Unknown: true,
+  },
 };
 
 export function loadSettings() {
