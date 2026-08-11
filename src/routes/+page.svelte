@@ -4,14 +4,18 @@
   import { onMount, onDestroy } from "svelte";
   import { themes, themeCategories, applyTheme, getStoredTheme } from "$lib/themes.js";
   import { loadSettings, saveSettings, applySettings } from "$lib/settings.js";
+  import { loadLicenseStatus } from "$lib/license.js";
+  import LicenseGate from "$lib/LicenseGate.svelte";
 
   let settings = $state(loadSettings());
   let isCapturing = $state(false);
   let messages = $state([]);
   let unlisten = null;
+  let unlistenLocked = null;
   let currentTheme = $state(settings.theme || getStoredTheme());
   let showThemePicker = $state(false);
   let showSettings = $state(false);
+  let license = $state(null);
 
   const languages = [
     { code: "en", name: "English" },
@@ -33,6 +37,7 @@
     try {
       isCapturing = await invoke("get_capture_status");
       settings.targetLanguage = await invoke("get_target_language");
+      license = await loadLicenseStatus();
     } catch (e) {
       console.error("Failed to load state:", e);
     }
@@ -41,11 +46,21 @@
       const msg = event.payload;
       messages = [...messages.slice(-settings.maxMessages + 1), msg];
     });
+
+    // Backend drops messages while locked; re-check status when told
+    unlistenLocked = await listen("license-locked", async () => {
+      license = await loadLicenseStatus();
+    });
   });
 
   onDestroy(() => {
     if (unlisten) unlisten();
+    if (unlistenLocked) unlistenLocked();
   });
+
+  function onLicenseActivated(s) {
+    license = s;
+  }
 
   async function toggleCapture() {
     try {
@@ -129,6 +144,11 @@
       </button>
     </div>
   </div>
+
+  <!-- License gate: trial banner or full paywall overlay -->
+  {#if license && license.mode !== "licensed"}
+    <LicenseGate status={license} onactivated={onLicenseActivated} />
+  {/if}
 
   <!-- Settings panel -->
   {#if showSettings}
