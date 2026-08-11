@@ -35,8 +35,25 @@ impl PacketSniffer {
             return Err(SnifferError::AlreadyRunning);
         }
 
-        let device = Device::lookup()
+        // Pick the interface that owns the default route — Device::lookup()
+        // happily returns tailscale0/lo and silently captures nothing.
+        let route_dev = std::process::Command::new("ip")
+            .args(["-4", "route", "show", "default"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                s.split_whitespace()
+                    .skip_while(|&w| w != "dev")
+                    .nth(1)
+                    .map(|w| w.to_string())
+            });
+
+        let device = Device::list()
             .map_err(|e| SnifferError::DeviceLookup(e.to_string()))?
+            .into_iter()
+            .find(|d| Some(&d.name) == route_dev.as_ref())
+            .or_else(|| Device::lookup().ok().flatten())
             .ok_or(SnifferError::NoDevice)?;
 
         info!("Using device: {}", device.name);
