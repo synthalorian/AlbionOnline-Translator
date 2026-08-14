@@ -82,7 +82,7 @@ fn main() {
                     src,
                     dst
                 );
-                let n = payload.len().min(96);
+                let n = payload.len().min(256);
                 for chunk in payload[..n].chunks(16) {
                     print!("  ");
                     for b in chunk {

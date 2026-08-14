@@ -1,16 +1,18 @@
 use pcap::{Capture, Device};
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::{network::{extract_udp_payload, ip_in_cidr}, photon::{ChatChannel, PhotonDecoder}, translator::TranslationEngine};
+use crate::{network::extract_udp_payload, photon::PhotonDecoder, translator::TranslationEngine};
 use crate::photon;
 
-// Albion Online server IP ranges.
-const ALBION_CIDRS: [&str; 1] = ["5.188.125.0/24"];
-const ALBION_UDP_PORTS: [u16; 2] = [5056, 4535];
+// Albion's game UDP ports are stable across the entire server fleet, while
+// the server IPs rotate across many ranges (5.188.125.x, 5.45.187.x,
+// 193.169.238.x, 85.234.70.x all observed live), so an IP whitelist silently
+// drops chat from any range not listed. Filter on ports instead; the decoder
+// still validates payloads, so unrelated traffic on these ports is dropped.
+const ALBION_UDP_FILTER: &str = "udp port 5055 or udp port 5056 or udp port 4535";
 
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
@@ -83,7 +85,9 @@ impl PacketSniffer {
         }
         let mut cap = cap.expect("capture open should succeed after retries");
 
-        cap.filter("udp port 5056 or udp port 4535", true)
+        // See ALBION_UDP_FILTER: the fleet's ports are stable, its IPs are
+        // not, so filter on ports.
+        cap.filter(ALBION_UDP_FILTER, true)
             .map_err(|e| SnifferError::Filter(e.to_string()))?;
 
         self.running.store(true, Ordering::SeqCst);
@@ -117,18 +121,11 @@ impl PacketSniffer {
                     Ok(packet) => {
                         packet_number += 1;
 
-                        // Extract UDP payload from raw ethernet frame.
-                        if let Some((src_ip, dst_ip, payload)) =
-                            extract_udp_payload(packet.data)
-                        {
-                            // Filter to Albion server IPs only.
-                            if !ALBION_CIDRS.iter().any(|cidr| {
-                                ip_in_cidr(src_ip, cidr) || ip_in_cidr(dst_ip, cidr)
-                            }) {
-                                filtered_count += 1;
-                                continue;
-                            }
-
+                        // Extract UDP payload from raw ethernet frame. The BPF
+                        // port filter already gates on Albion's ports; the
+                        // decoder below validates structure, so non-Albion
+                        // traffic never survives to the channel.
+                        if let Some((_, _, payload)) = extract_udp_payload(packet.data) {
                             if let Some(msg) = decoder.decode(payload) {
                                 // Bounded channel = backpressure: if the translator
                                 // is busy, drop further processing instead of
@@ -138,6 +135,10 @@ impl PacketSniffer {
                                     break;
                                 }
                             }
+                        } else {
+                            // Packet passed the port filter but isn't extractable
+                            // IP/UDP — count it so the stop log stays diagnostic.
+                            filtered_count += 1;
                         }
                     }
                     Err(e) => {

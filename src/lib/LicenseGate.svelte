@@ -48,7 +48,7 @@
   <!-- Hard paywall: covers the entire overlay -->
   <div class="gate-overlay">
     <div class="gate-card">
-      <div class="gate-logo">🎹🦞</div>
+      <div class="gate-logo">⚔️📜</div>
       <h2>Trial ended</h2>
       <p class="gate-copy">
         Albion Translator is a one-time purchase — no subscription, ever.
