@@ -1,5 +1,7 @@
 // Settings management for Albion Online Translator
 
+/** @typedef {{ opacity: number, fontSize: number, maxMessages: number, showTimestamps: boolean, showOriginal: boolean, showTranslated: boolean, clickThrough: boolean, alwaysOnTop: boolean, theme: string, targetLanguage: string }} Settings */
+
 const defaultSettings = {
   opacity: 0.92,
   fontSize: 13,
@@ -38,6 +40,7 @@ export function loadSettings() {
   return { ...defaultSettings };
 }
 
+/** @param {Settings} settings */
 export function saveSettings(settings) {
   try {
     localStorage.setItem('albion-translator-settings', JSON.stringify(settings));
@@ -46,11 +49,12 @@ export function saveSettings(settings) {
   }
 }
 
+/** @param {Settings} settings */
 export function applySettings(settings) {
   const root = document.documentElement;
   
   // Apply opacity
-  root.style.setProperty('--app-opacity', settings.opacity);
+  root.style.setProperty('--app-opacity', String(settings.opacity));
   
   // Apply font size
   root.style.setProperty('--app-font-size', `${settings.fontSize}px`);

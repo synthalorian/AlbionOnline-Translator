@@ -327,10 +327,17 @@ export const themeCategories = {
   classic: { name: 'Classic', emoji: '🎨' },
 };
 
+/** @typedef {{ name: string, emoji: string, description: string, category: string, colors: Record<string, string> }} Theme */
+
+/** @type {Record<string, Theme>} */
+const themeIndex = themes;
+
+/** @param {string} themeId */
 export function getTheme(themeId) {
-  return themes[themeId] || themes['synthwave-84'];
+  return themeIndex[themeId] || themeIndex['synthwave-84'];
 }
 
+/** @param {string} themeId */
 export function applyTheme(themeId) {
   const theme = getTheme(themeId);
   const root = document.documentElement;
