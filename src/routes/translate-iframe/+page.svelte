@@ -181,15 +181,18 @@
     color: var(--accent-primary);
   }
   .iframe-lang {
+    appearance: none;
+    -webkit-appearance: none;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     border-radius: 6px;
     color: var(--text-primary);
-    padding: 2px 6px;
+    padding: 2px 22px 2px 6px;
     font-size: 11px;
     cursor: pointer;
-    outline: none;
-    max-width: 110px;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23f0e0ff'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 6px center;
   }
   .iframe-lang:focus {
     border-color: var(--border-glow);
