@@ -691,14 +691,19 @@
   }
 
   .lang-select {
+    appearance: none;
+    -webkit-appearance: none;
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     border-radius: 6px;
     color: var(--text-primary);
-    padding: 4px 8px;
+    padding: 4px 24px 4px 8px;
     font-size: 12px;
     cursor: pointer;
     outline: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23f0e0ff'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
   }
 
   .lang-select:focus {
