@@ -1,29 +1,24 @@
 use pcap::{Capture, Device};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use albion_network_lib::{
-    DecodedPacket, ExtractedPacket, HostFilter, PhotonParser, PhotonParserConfig,
-    extract_udp_payload,
-};
+use crate::{network::{extract_udp_payload, ip_in_cidr}, photon::{ChatChannel, PhotonDecoder}, translator::TranslationEngine};
+use crate::photon;
 
-use crate::photon::{ChatMessage as UiChatMessage, ChatChannel as UiChatChannel};
-use crate::translator::TranslationEngine;
-
-// Albion Online server IP ranges (from albion-translator hosts.txt)
-const ALBION_CIDRS: &[&str] = &[
-    "5.188.125.0/24",
-];
+// Albion Online server IP ranges.
+const ALBION_CIDRS: [&str; 1] = ["5.188.125.0/24"];
+const ALBION_UDP_PORTS: [u16; 2] = [5056, 4535];
 
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
-    tx: mpsc::Sender<UiChatMessage>,
+    tx: mpsc::Sender<photon::ChatMessage>,
 }
 
 impl PacketSniffer {
-    pub fn new(tx: mpsc::Sender<UiChatMessage>) -> Self {
+    pub fn new(tx: mpsc::Sender<photon::ChatMessage>) -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
             tx,
@@ -73,51 +68,52 @@ impl PacketSniffer {
         let running = self.running.clone();
         let tx = self.tx.clone();
 
+        // Raw decoded (untranslated) messages flow into a bounded channel;
+        // a dedicated worker translates them off the capture loop so a slow
+        // network call can never stall packet sniffing.
+        let (raw_tx, mut raw_rx) = mpsc::channel::<photon::ChatMessage>(64);
+
+        tokio::spawn(async move {
+            let mut translator = TranslationEngine::new();
+            while let Some(msg) = raw_rx.recv().await {
+                let ui_msg = Self::convert_message(&msg, &mut translator).await;
+                if tx.send(ui_msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         tokio::spawn(async move {
             info!("Packet capture started");
-            
-            // Build host filter for Albion servers
-            let host_filter = HostFilter::from_cidrs(ALBION_CIDRS.iter().map(|s| *s))
-                .expect("Invalid CIDR range");
-            info!("Filtering to {} Albion server ranges", host_filter.len());
-            
-            let config = PhotonParserConfig::with_defaults("live".to_string(), false);
-            let mut parser = PhotonParser::new(config);
-            let mut translator = TranslationEngine::new();
+
+            let decoder = PhotonDecoder::new();
             let mut packet_number = 0usize;
             let mut filtered_count = 0usize;
-            
+
             while running.load(Ordering::SeqCst) {
                 match cap.next_packet() {
                     Ok(packet) => {
                         packet_number += 1;
-                        
-                        if let Some(udp_packet) = extract_udp_payload(packet.data, None) {
-                            // Filter to Albion servers only
-                            if !host_filter.contains(udp_packet.source.ip) 
-                                && !host_filter.contains(udp_packet.destination.ip) {
+
+                        // Extract UDP payload from raw ethernet frame.
+                        if let Some((src_ip, dst_ip, payload)) =
+                            extract_udp_payload(packet.data)
+                        {
+                            // Filter to Albion server IPs only.
+                            if !ALBION_CIDRS.iter().any(|cidr| {
+                                ip_in_cidr(src_ip, cidr) || ip_in_cidr(dst_ip, cidr)
+                            }) {
                                 filtered_count += 1;
                                 continue;
                             }
-                            
-                            let before = parser.decoded_packets().len();
-                            let _ = parser.receive_packet(
-                                udp_packet.payload,
-                                packet_number,
-                                udp_packet.source,
-                                udp_packet.destination,
-                            );
-                            
-                            // Process newly decoded packets
-                            for decoded in &parser.decoded_packets()[before..] {
-                                if let DecodedPacket::Event(event) = decoded {
-                                    if let Some(ExtractedPacket::ChatMessage(_)) = &event.extracted {
-                                        let ui_msg = Self::convert_message(&event.extracted, &mut translator).await;
-                                        if tx.send(ui_msg).await.is_err() {
-                                            error!("Failed to send chat message");
-                                            break;
-                                        }
-                                    }
+
+                            if let Some(msg) = decoder.decode(payload) {
+                                // Bounded channel = backpressure: if the translator
+                                // is busy, drop further processing instead of
+                                // queueing unbounded work.
+                                if raw_tx.send(msg).await.is_err() {
+                                    error!("Failed to send chat message");
+                                    break;
                                 }
                             }
                         }
@@ -129,8 +125,11 @@ impl PacketSniffer {
                     }
                 }
             }
-            
-            info!("Packet capture stopped. Total: {}, Filtered: {}", packet_number, filtered_count);
+
+            info!(
+                "Packet capture stopped. Total: {}, Filtered: {}",
+                packet_number, filtered_count
+            );
         });
 
         Ok(())
@@ -144,61 +143,26 @@ impl PacketSniffer {
         self.running.load(Ordering::SeqCst)
     }
 
-    async fn convert_message(extracted: &Option<ExtractedPacket>, translator: &mut TranslationEngine) -> UiChatMessage {
-        let now = chrono::Local::now();
-        
-        // Serialize to JSON to extract fields
-        let json = serde_json::to_value(extracted).unwrap_or_default();
-        
-        let player_name = json.get("player_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown")
-            .to_string();
-        
-        let message = json.get("message")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        
-        let channel_type = json.get("channel_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("Unknown");
-        
-        // Detect language
-        let source_lang = translator.detect_language(&message);
-        
-        // Translate if needed
+    async fn convert_message(msg: &photon::ChatMessage, translator: &mut TranslationEngine) -> photon::ChatMessage {
+        let source_lang = translator.detect_language(&msg.text);
+
         let translated_text = if let Some(ref src) = source_lang {
             if src != translator.target_language() {
-                translator.translate(&message, Some(src)).await
+                translator.translate(&msg.text, Some(src)).await
             } else {
                 None
             }
         } else {
             None
         };
-        
-        UiChatMessage {
-            timestamp: now.format("%H:%M:%S").to_string(),
-            channel: Self::map_channel(channel_type),
-            sender: player_name,
-            text: message,
+
+        photon::ChatMessage {
+            timestamp: msg.timestamp.clone(),
+            channel: msg.channel.clone(),
+            sender: msg.sender.clone(),
+            text: msg.text.clone(),
             source_lang,
             translated_text,
-        }
-    }
-
-    fn map_channel(channel: &str) -> UiChatChannel {
-        match channel {
-            "Say" | "Local" => UiChatChannel::Say,
-            "Guild" => UiChatChannel::Guild,
-            "Faction" => UiChatChannel::Faction,
-            "Whisper" => UiChatChannel::Whisper,
-            "Party" => UiChatChannel::Party,
-            "Alliance" => UiChatChannel::Alliance,
-            "Global" => UiChatChannel::Global,
-            "Trade" => UiChatChannel::Trade,
-            _ => UiChatChannel::Unknown,
         }
     }
 }
