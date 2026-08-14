@@ -36,6 +36,7 @@
     }
   }
 
+  /** @param {number} days */
   function fmtTrial(days) {
     if (days <= 0) return "Trial expires today";
     if (days === 1) return "1 day left in trial";
