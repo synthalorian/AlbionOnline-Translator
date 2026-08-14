@@ -211,7 +211,7 @@
   <!-- Title bar -->
   <div class="title-bar">
     <div class="title">
-      <span class="logo">🎹🦞</span>
+      <span class="logo">⚔️📜</span>
       <span>Albion Translator</span>
     </div>
     <div class="controls">

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::trace;
+use tracing::{debug, trace};
 
 /// Photon Unity Networking protocol decoder for Albion Online
 /// Ported from albion-network-lib Protocol18 (commit f373e56)
@@ -187,27 +187,44 @@ impl PhotonDecoder {
             return None;
         }
 
-        let event_code = data[0] as i32;
-        trace!("Event code: {}", event_code);
+        // The first byte of an event payload is a Photon-level code. The real
+        // Albion event code rides in parameter 252 (albion-network-lib
+        // parse_event_code), except Move (3) which is special-cased from the
+        // Photon-level byte. Verified against live wire capture: a chat packet
+        // carries payload [0x01][param table: {0: channel, 1: name, 2: text,
+        // 252: 73}].
+        let photon_event_code = data[0] as i32;
+        let mut params = self.deserialize_parameter_table(&mut Reader::new(&data[1..]))?;
+        debug!(
+            "EVENT photon_code={} params={} raw={:02x?}",
+            photon_event_code,
+            params.len(),
+            &data[..data.len().min(40)]
+        );
+
+        if photon_event_code == 3 {
+            params.insert(252, serde_json::json!(3)); // Move
+        }
+
+        let event_code = parse_event_code(&params)?;
+        debug!("Event code: {}", event_code);
 
         // Chat events (from albion-network-lib EventCode)
         match event_code {
-            73 => self.decode_chat_message(&data[1..]), // ChatMessage
-            74 => self.decode_chat_say(&data[1..]),     // ChatSay
-            75 => self.decode_chat_whisper(&data[1..]), // ChatWhisper
+            73 => self.decode_chat_message(&params), // ChatMessage
+            74 => self.decode_chat_say(&params),     // ChatSay
+            75 => self.decode_chat_whisper(&params), // ChatWhisper
             _ => None,
         }
     }
 
-    fn decode_chat_message(&self, data: &[u8]) -> Option<ChatMessage> {
+    fn decode_chat_message(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
         // ChatMessage event structure (Protocol18):
-        // param 0: channel_id (compressed i64)
+        // param 0: channel_id
         // param 1: player_name (string)
         // param 2: message (string)
 
-        let params = self.deserialize_parameter_table(&mut Reader::new(data))?;
-
-        let channel_id = value_i64(&params, 0)?;
+        let channel_id = value_i64(params, 0)?;
         let player_name = params.get(&1)?.as_str()?.to_string();
         let message = params.get(&2)?.as_str()?.to_string();
 
@@ -225,12 +242,10 @@ impl PhotonDecoder {
         })
     }
 
-    fn decode_chat_say(&self, data: &[u8]) -> Option<ChatMessage> {
+    fn decode_chat_say(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
         // ChatSay event structure:
         // param 0: player_name (string)
         // param 1: message (string)
-
-        let params = self.deserialize_parameter_table(&mut Reader::new(data))?;
 
         let player_name = params.get(&0)?.as_str()?.to_string();
         let message = params.get(&1)?.as_str()?.to_string();
@@ -247,12 +262,10 @@ impl PhotonDecoder {
         })
     }
 
-    fn decode_chat_whisper(&self, data: &[u8]) -> Option<ChatMessage> {
+    fn decode_chat_whisper(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
         // ChatWhisper event structure:
         // param 0: player_name (string)
         // param 1: message (string)
-
-        let params = self.deserialize_parameter_table(&mut Reader::new(data))?;
 
         let player_name = params.get(&0)?.as_str()?.to_string();
         let message = params.get(&1)?.as_str()?.to_string();
@@ -614,6 +627,34 @@ fn value_i64(params: &HashMap<u8, serde_json::Value>, key: u8) -> Option<i64> {
     params.get(&key).and_then(json_value_to_i64)
 }
 
+/// Mirrors albion-network-lib parse_event_code: the real Albion event code is
+/// carried in parameter 252, and may be encoded as a signed 16-bit value or as
+/// `(code << 4) | 0x01` when the low nibble is a version marker.
+fn parse_event_code(params: &HashMap<u8, serde_json::Value>) -> Option<i32> {
+    let value = value_i64(params, 252)?;
+    let code = to_signed_short(value);
+    if is_chat_event(code) {
+        return Some(code);
+    }
+    let shifted = ((code as i64 & 0xffff) >> 4) as i32;
+    if (code & 0x0f) == 0x01 && is_chat_event(shifted) {
+        return Some(shifted);
+    }
+    None
+}
+
+fn to_signed_short(value: i64) -> i32 {
+    let mut value = (value & 0xffff) as i32;
+    if value >= 0x8000 {
+        value -= 0x10000;
+    }
+    value
+}
+
+fn is_chat_event(code: i32) -> bool {
+    matches!(code, 73 | 74 | 75) // ChatMessage | ChatSay | ChatWhisper
+}
+
 fn params_to_value(params: HashMap<u8, serde_json::Value>) -> serde_json::Value {
     serde_json::Value::Object(
         params
@@ -798,12 +839,18 @@ mod tests {
     /// a chat event, mirroring the exact wire format observed in live captures:
     ///   [peer_id(2)][flags(1)][cmd_count(1)][timestamp(4)][challenge(4)]
     ///   [cmd_type(1)][channel(1)][cmd_flags(1)][reserved(1)][cmd_len(4)][seq(4)]
-    ///   [unreliable_seq(4)] [prefix(1)][msg_type(1)][event_code(1)][param_table...]
+    ///   [unreliable_seq(4)] [prefix(1)][msg_type(1)][photon_code(1)][param_table...]
+    /// The Albion event code is appended to the param table as key 252 (the real
+    /// wire format carries the code there, not in the photon code byte).
     fn build_chat_packet(event_code: u8, params: &[u8]) -> Vec<u8> {
+        let mut param_table = vec![params[0] + 1]; // param count + the 252 entry
+        param_table.extend_from_slice(&params[1..]);
+        param_table.extend_from_slice(&[0xfc, 0x0b, event_code]); // key 252, type u8, code
+
         let mut msg = vec![0x00]; // prefix byte (skipped by message parser)
         msg.push(0x04); // MESSAGE_EVENT
-        msg.push(event_code);
-        msg.extend_from_slice(params);
+        msg.push(0x01); // photon-level code (1 for chat events on the wire)
+        msg.extend_from_slice(&param_table);
 
         let mut pkt = Vec::new();
         pkt.extend_from_slice(&[0x00, 0x00]); // peer_id
@@ -876,13 +923,13 @@ mod tests {
         // SendFragment (8): [start_seq(4)][??(4)][??(4)][total_len(4)][frag_offset(4)][fragment]
         // Split a chat message into two fragments across two packets.
         let params = [
-            0x03, 0x00, 0x0A, 0x00, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
-            b'H', b'e', b'l', b'l', b'o',
+            0x04, 0x00, 0x0A, 0x00, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
+            b'H', b'e', b'l', b'l', b'o', 0xfc, 0x0b, 73,
         ];
         let msg = {
             let mut m = vec![0x00]; // prefix
             m.push(0x04); // MESSAGE_EVENT
-            m.push(73); // ChatMessage
+            m.push(0x01); // photon-level code
             m.extend_from_slice(&params);
             m
         };

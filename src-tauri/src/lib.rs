@@ -97,7 +97,7 @@ async fn translate_user_text(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
-        .with_env_filter("albion_translator=debug,info")
+        .with_env_filter("albion_translator=debug,albion_translator_lib=debug,info")
         .init();
 
     let (tx, mut rx) = mpsc::channel::<photon::ChatMessage>(100);

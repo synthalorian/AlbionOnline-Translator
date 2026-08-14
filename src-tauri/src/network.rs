@@ -119,30 +119,19 @@ fn parse_ipv6_header(data: &[u8]) -> Option<Ipv6Header> {
 
 // ── UDP payload extraction ──────────────────────────────────────────────────
 
-const UDP_PORT_ALBION_MAIN: u16 = 5056;
-const UDP_PORT_ALBION_DTLS: u16 = 4535;
-
 /// Extract UDP payload from an IPv4 packet. Returns (src_ip, dst_ip, payload).
 fn extract_udp_payload_ipv4(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     let ip = parse_ipv4_header(data)?;
     if ip.protocol != 17 {
         return None;
     }
-    let ip_start = ETHERNET_HEADER_LEN;
-    let ip_end = ip_start + ip.header_len;
+    let ip_end = ip.header_len;
     if ip_end + UDP_HEADER_LEN > data.len() {
         return None;
     }
     let src_ip = IpAddr::V4(ip.src_ip);
     let dst_ip = IpAddr::V4(ip.dst_ip);
     let udp_start = ip_end;
-    let src_port = u16::from_be_bytes([data[udp_start], data[udp_start + 1]]);
-    let dst_port = u16::from_be_bytes([data[udp_start + 2], data[udp_start + 3]]);
-    if src_port != UDP_PORT_ALBION_MAIN && src_port != UDP_PORT_ALBION_DTLS
-        && dst_port != UDP_PORT_ALBION_MAIN && dst_port != UDP_PORT_ALBION_DTLS
-    {
-        return None;
-    }
     let payload_start = udp_start + UDP_HEADER_LEN;
     let payload = &data[payload_start..];
     Some((src_ip, dst_ip, payload))
@@ -154,28 +143,19 @@ fn extract_udp_payload_ipv6(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     if ip.next_header != 17 {
         return None;
     }
-    let ip_start = ETHERNET_HEADER_LEN;
-    let udp_start = ip_start + IPV6_HEADER_LEN;
+    let udp_start = IPV6_HEADER_LEN;
     if udp_start + UDP_HEADER_LEN > data.len() {
         return None;
     }
     let src_ip = IpAddr::V6(ip.src_ip);
     let dst_ip = IpAddr::V6(ip.dst_ip);
-    let src_port = u16::from_be_bytes([data[udp_start], data[udp_start + 1]]);
-    let dst_port = u16::from_be_bytes([data[udp_start + 2], data[udp_start + 3]]);
-    if src_port != UDP_PORT_ALBION_MAIN && src_port != UDP_PORT_ALBION_DTLS
-        && dst_port != UDP_PORT_ALBION_MAIN && dst_port != UDP_PORT_ALBION_DTLS
-    {
-        return None;
-    }
     let payload_start = udp_start + UDP_HEADER_LEN;
     let payload = &data[payload_start..];
     Some((src_ip, dst_ip, payload))
 }
 
 /// Extract UDP payload from a raw ethernet frame (what pcap hands us).
-/// Tries IPv4 first, then IPv6. Returns None if the frame isn't IP/UDP or
-/// isn't on an Albion UDP port.
+/// Tries IPv4 first, then IPv6. Returns None if the frame isn't IP/UDP.
 pub fn extract_udp_payload(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     let eth = parse_ethernet_header(data)?;
     match eth.ether_type {
@@ -262,4 +242,68 @@ fn ipv6_in_cidr(ip: Ipv6Addr, cidr: &str) -> bool {
     };
     let ip_u128 = u128::from(ip);
     (ip_u128 & mask) == (net_u128 & mask)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a full ethernet+IPv4+UDP frame wrapping `payload` as the UDP body.
+    /// Mirrors what pcap hands to extract_udp_payload on the wire.
+    fn wrap_udp_frame(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst mac
+        frame.extend_from_slice(&[0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb]); // src mac
+        frame.extend_from_slice(&[0x08, 0x00]); // IPv4 ethertype
+        // IPv4 header, 20 bytes, no options
+        frame.push(0x45); // version 4, ihl 5
+        frame.push(0x00); // dscp/ecn
+        let total_len = 20 + 8 + payload.len();
+        frame.extend_from_slice(&(total_len as u16).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x01]); // id
+        frame.extend_from_slice(&[0x40, 0x00]); // flags/frag
+        frame.push(64); // ttl
+        frame.push(17); // udp
+        frame.extend_from_slice(&[0x00, 0x00]); // checksum (ignored by parser)
+        frame.extend_from_slice(&[5, 188, 125, 53]); // src ip
+        frame.extend_from_slice(&[10, 208, 46, 229]); // dst ip
+        // UDP header
+        frame.extend_from_slice(&[0x13, 0xc0]); // src port 5056
+        frame.extend_from_slice(&[0xa4, 0xf8]); // dst port
+        frame.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x00]); // checksum
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    #[test]
+    fn extracts_udp_payload_at_photon_offset() {
+        // Real ground-truth payload from tcpdump: Photon envelope (12B) + one
+        // SendUnreliable(07) command (12B) + unreliable seq (4B) + MESSAGE_EVENT.
+        // command_count=3 lives at byte 3, so a +14 offset bug would read 0.
+        let payload: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x03, // peer_id, flags, command_count = 3
+            0xd2, 0xe7, 0x5d, 0x32, // timestamp
+            0x68, 0xe4, 0xd5, 0xa1, // challenge
+            0x07, 0x00, 0x00, 0x00, // SendUnreliable, channel, flags, reserved
+            0x00, 0x00, 0x00, 0x39, // command length = 57
+            0x00, 0x00, 0x14, 0x13, // sequence
+            0x00, 0x00, 0x29, 0x81, // unreliable seq
+            0xf3, 0x04, // MESSAGE_EVENT
+        ];
+        let frame = wrap_udp_frame(&payload);
+        let (src, dst, extracted) = extract_udp_payload(&frame).expect("extract");
+        assert_eq!(src, IpAddr::V4(Ipv4Addr::new(5, 188, 125, 53)));
+        assert_eq!(dst, IpAddr::V4(Ipv4Addr::new(10, 208, 46, 229)));
+        assert_eq!(extracted, payload.as_slice());
+        assert_eq!(extracted[3], 0x03, "command_count must be at byte 3");
+        assert_eq!(&extracted[28..30], &[0xf3, 0x04], "message must start at byte 28");
+    }
+
+    #[test]
+    fn rejects_non_udp_frames() {
+        let mut frame = wrap_udp_frame(&[1, 2, 3]);
+        frame[23] = 6; // tcp instead of udp
+        assert!(extract_udp_payload(&frame).is_none());
+    }
 }
