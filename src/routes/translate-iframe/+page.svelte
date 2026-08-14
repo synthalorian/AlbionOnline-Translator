@@ -2,19 +2,7 @@
   import { onMount } from "svelte";
   import { loadSettings, saveSettings } from "$lib/settings.js";
   import { applyTheme, getStoredTheme } from "$lib/themes.js";
-
-  const languages = [
-    { code: "en", name: "English" },
-    { code: "es", name: "Español" },
-    { code: "pt", name: "Português" },
-    { code: "zh", name: "中文" },
-    { code: "ru", name: "Русский" },
-    { code: "de", name: "Deutsch" },
-    { code: "fr", name: "Français" },
-    { code: "ko", name: "한국어" },
-    { code: "ja", name: "日本語" },
-    { code: "tr", name: "Türkçe" },
-  ];
+  import { languages } from "$lib/languages.js";
 
   // Defaults come from the shared settings store (same origin, same localStorage)
   const stored = loadSettings();
