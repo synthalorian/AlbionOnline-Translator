@@ -15,7 +15,7 @@ pub struct ChatMessage {
     pub translated_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub enum ChatChannel {
     Say,
     Whisper,
@@ -42,6 +42,20 @@ impl std::fmt::Display for ChatChannel {
             ChatChannel::LFG => write!(f, "LFG"),
             ChatChannel::Faction => write!(f, "Faction"),
             ChatChannel::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+impl ChatChannel {
+    /// Maps the client-side chat index (carried in JoinedChatChannel events as
+    /// param 0) to a channel. Values verified against albion-network-lib
+    /// `from_chat_index`; unknown indices default to Say like the reference.
+    fn from_chat_index(index: i64) -> ChatChannel {
+        match index {
+            27 => ChatChannel::Say,
+            24 => ChatChannel::Guild,
+            29 => ChatChannel::Faction,
+            _ => ChatChannel::Say,
         }
     }
 }
@@ -164,7 +178,7 @@ impl PhotonDecoder {
         None
     }
 
-    fn decode_message(&self, data: &[u8]) -> Option<ChatMessage> {
+    fn decode_message(&mut self, data: &[u8]) -> Option<ChatMessage> {
         if data.len() < 2 {
             return None;
         }
@@ -182,7 +196,7 @@ impl PhotonDecoder {
         }
     }
 
-    fn decode_event(&self, data: &[u8]) -> Option<ChatMessage> {
+    fn decode_event(&mut self, data: &[u8]) -> Option<ChatMessage> {
         if data.is_empty() {
             return None;
         }
@@ -214,8 +228,42 @@ impl PhotonDecoder {
             73 => self.decode_chat_message(&params), // ChatMessage
             74 => self.decode_chat_say(&params),     // ChatSay
             75 => self.decode_chat_whisper(&params), // ChatWhisper
+            207 => {
+                self.handle_joined_chat_channel(&params); // JoinedChatChannel
+                None
+            }
+            208 => {
+                self.handle_left_chat_channel(&params); // LeftChatChannel
+                None
+            }
             _ => None,
         }
+    }
+
+    fn handle_joined_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
+        // JoinedChatChannel (207): param 0 = chat_index (u8), param 1 = channel_id (i64)
+        let chat_index = value_i64(params, 0);
+        let channel_id = value_i64(params, 1);
+        let (Some(chat_index), Some(channel_id)) = (chat_index, channel_id) else {
+            debug!("JoinedChatChannel with missing params: {:?}", params);
+            return;
+        };
+        let channel = ChatChannel::from_chat_index(chat_index);
+        debug!(
+            "Chat channel joined: id={} index={} -> {}",
+            channel_id, chat_index, channel
+        );
+        self.channel_map.insert(channel_id, channel);
+    }
+
+    fn handle_left_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
+        // LeftChatChannel (208): param 0 = channel_id
+        let Some(channel_id) = value_i64(params, 0) else {
+            debug!("LeftChatChannel with missing params: {:?}", params);
+            return;
+        };
+        debug!("Chat channel left: id={}", channel_id);
+        self.channel_map.remove(&channel_id);
     }
 
     fn decode_chat_message(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
@@ -229,6 +277,10 @@ impl PhotonDecoder {
         let message = params.get(&2)?.as_str()?.to_string();
 
         let channel = self.map_channel(channel_id);
+        debug!(
+            "ChatMessage: channel_id={} channel={} sender={} text={:?}",
+            channel_id, channel, player_name, message
+        );
 
         let now = chrono::Local::now();
 
@@ -283,7 +335,12 @@ impl PhotonDecoder {
     }
 
     fn map_channel(&self, channel_id: i64) -> ChatChannel {
-        // From albion-network-lib ChatChannel mapping
+        // Session-assigned channel_ids only resolve through the live map built
+        // from JoinedChatChannel (207) events; the static fallback below covers
+        // the few well-known ids the reference lib hardcodes.
+        if let Some(channel) = self.channel_map.get(&channel_id) {
+            return *channel;
+        }
         match channel_id {
             0 => ChatChannel::Say,
             3517 => ChatChannel::Guild,
@@ -633,11 +690,11 @@ fn value_i64(params: &HashMap<u8, serde_json::Value>, key: u8) -> Option<i64> {
 fn parse_event_code(params: &HashMap<u8, serde_json::Value>) -> Option<i32> {
     let value = value_i64(params, 252)?;
     let code = to_signed_short(value);
-    if is_chat_event(code) {
+    if is_relevant_event(code) {
         return Some(code);
     }
     let shifted = ((code as i64 & 0xffff) >> 4) as i32;
-    if (code & 0x0f) == 0x01 && is_chat_event(shifted) {
+    if (code & 0x0f) == 0x01 && is_relevant_event(shifted) {
         return Some(shifted);
     }
     None
@@ -651,8 +708,11 @@ fn to_signed_short(value: i64) -> i32 {
     value
 }
 
-fn is_chat_event(code: i32) -> bool {
-    matches!(code, 73 | 74 | 75) // ChatMessage | ChatSay | ChatWhisper
+/// Events the decoder acts on: chat events plus the channel state events that
+/// map session-assigned channel_ids to their chat channel (from the AOSnifferNET
+/// / albion-network-lib EventCode tables).
+fn is_relevant_event(code: i32) -> bool {
+    matches!(code, 73 | 74 | 75 | 207 | 208) // ChatMessage | ChatSay | ChatWhisper | JoinedChatChannel | LeftChatChannel
 }
 
 fn params_to_value(params: HashMap<u8, serde_json::Value>) -> serde_json::Value {
@@ -916,6 +976,77 @@ mod tests {
         ];
         let mut decoder = PhotonDecoder::new();
         assert!(decoder.decode(&build_chat_packet(3, &params)).is_none());
+    }
+
+    #[test]
+    fn resolves_channel_from_join_event() {
+        // JoinedChatChannel (207): param 0 = chat_index (u8, 24 = Guild),
+        // param 1 = channel_id (compressed i64, 42). After the join, a
+        // ChatMessage on channel 42 must resolve to Guild.
+        let join_params = [
+            0x02, // param table size
+            0x00, 0x0B, 24, // key 0, type u8, chat_index 24 (Guild)
+            0x01, 0x0A, 0x54, // key 1, compressed i64, channel_id 42
+        ];
+        let mut decoder = PhotonDecoder::new();
+        assert!(decoder.decode(&build_chat_packet(207, &join_params)).is_none());
+
+        let msg_params = [
+            0x03, // param table size
+            0x00, 0x0A, 0x54, // key 0, compressed i64, channel_id 42
+            0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', // key 1, string "Albi"
+            0x02, 0x07, 0x05, b'H', b'e', b'l', b'l', b'o', // key 2, string "Hello"
+        ];
+        let msg = decoder
+            .decode(&build_chat_packet(73, &msg_params))
+            .expect("chat message after join");
+        assert_eq!(msg.channel, ChatChannel::Guild);
+    }
+
+    #[test]
+    fn leaves_channel_falls_back_to_unknown() {
+        // Join then leave: after LeftChatChannel (208) removes channel 42, a
+        // message on it must fall back to Unknown (no static mapping for 42).
+        let join_params = [
+            0x02, 0x00, 0x0B, 24, 0x01, 0x0A, 0x54, // index 24 (Guild), id 42
+        ];
+        let mut decoder = PhotonDecoder::new();
+        decoder.decode(&build_chat_packet(207, &join_params));
+
+        let leave_params = [
+            0x01, // param table size
+            0x00, 0x0A, 0x54, // key 0, compressed i64, channel_id 42
+        ];
+        decoder.decode(&build_chat_packet(208, &leave_params));
+
+        let msg_params = [
+            0x03, 0x00, 0x0A, 0x54, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
+            b'H', b'e', b'l', b'l', b'o',
+        ];
+        let msg = decoder
+            .decode(&build_chat_packet(73, &msg_params))
+            .expect("chat message after leave");
+        assert_eq!(msg.channel, ChatChannel::Unknown);
+    }
+
+    #[test]
+    fn unknown_chat_index_defaults_to_say() {
+        // A JoinedChatChannel with an unmapped chat_index (e.g. 30) resolves
+        // to Say, matching albion-network-lib's fallback behavior.
+        let join_params = [
+            0x02, 0x00, 0x0B, 30, 0x01, 0x0A, 0x54, // index 30 (unmapped), id 42
+        ];
+        let mut decoder = PhotonDecoder::new();
+        decoder.decode(&build_chat_packet(207, &join_params));
+
+        let msg_params = [
+            0x03, 0x00, 0x0A, 0x54, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
+            b'H', b'e', b'l', b'l', b'o',
+        ];
+        let msg = decoder
+            .decode(&build_chat_packet(73, &msg_params))
+            .expect("chat message with unmapped index");
+        assert_eq!(msg.channel, ChatChannel::Say);
     }
 
     #[test]
