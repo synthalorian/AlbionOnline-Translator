@@ -53,13 +53,35 @@ impl PacketSniffer {
 
         info!("Using device: {}", device.name);
 
-        let mut cap = Capture::from_device(device)
-            .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?
-            .promisc(true)
-            .snaplen(65535)
-            .timeout(1000)
-            .open()
-            .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
+        let mut cap = None;
+        // cargo rebuilds replace the binary and wipe its setcap caps, so a
+        // freshly relaunched app can hit a brief permission window. Retry
+        // instead of failing the capture outright.
+        for attempt in 1..=5 {
+            let inactive = match Capture::from_device(device.clone()) {
+                Ok(d) => d,
+                Err(e) => return Err(SnifferError::CaptureOpen(e.to_string())),
+            };
+            match inactive
+                .promisc(true)
+                .snaplen(65535)
+                .timeout(1000)
+                .open()
+            {
+                Ok(c) => {
+                    cap = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    if attempt == 5 {
+                        return Err(SnifferError::CaptureOpen(e.to_string()));
+                    }
+                    error!("Capture open failed (attempt {}): {} — retrying", attempt, e);
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+            }
+        }
+        let mut cap = cap.expect("capture open should succeed after retries");
 
         cap.filter("udp port 5056 or udp port 4535", true)
             .map_err(|e| SnifferError::Filter(e.to_string()))?;
@@ -86,7 +108,7 @@ impl PacketSniffer {
         tokio::spawn(async move {
             info!("Packet capture started");
 
-            let decoder = PhotonDecoder::new();
+            let mut decoder = PhotonDecoder::new();
             let mut packet_number = 0usize;
             let mut filtered_count = 0usize;
 
