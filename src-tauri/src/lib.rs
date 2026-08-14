@@ -79,6 +79,21 @@ async fn get_buy_url() -> String {
     license::BUY_URL.to_string()
 }
 
+#[tauri::command]
+async fn translate_user_text(
+    text: String,
+    source_lang: Option<String>,
+    target_lang: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut engine = state.translator.lock().await;
+    let src = source_lang.as_deref();
+    match engine.translate_with_target(&text, src, &target_lang).await {
+        Some(t) => Ok(t),
+        None => Ok(text),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -120,6 +135,7 @@ pub fn run() {
             activate_license,
             deactivate_license,
             get_buy_url,
+            translate_user_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

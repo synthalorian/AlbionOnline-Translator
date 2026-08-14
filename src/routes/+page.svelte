@@ -2,20 +2,28 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
-  import { themes, themeCategories, applyTheme, getStoredTheme } from "$lib/themes.js";
+  import { themes, themeCategories, getTheme, applyTheme, getStoredTheme } from "$lib/themes.js";
   import { loadSettings, saveSettings, applySettings } from "$lib/settings.js";
   import { loadLicenseStatus } from "$lib/license.js";
   import LicenseGate from "$lib/LicenseGate.svelte";
 
   let settings = $state(loadSettings());
   let isCapturing = $state(false);
+
+  /** @typedef {{ timestamp: string, channel: string, sender: string, text: string, source_lang?: string, translated_text?: string }} ChatMessage */
+  /** @type {ChatMessage[]} */
   let messages = $state([]);
+  /** @type {(() => void) | null} */
   let unlisten = null;
+  /** @type {(() => void) | null} */
   let unlistenLocked = null;
   let currentTheme = $state(settings.theme || getStoredTheme());
   let showThemePicker = $state(false);
   let showSettings = $state(false);
+  /** @type {import("$lib/license.js").LicenseStatus | null} */
   let license = $state(null);
+  /** @type {HTMLIFrameElement | null} */
+  let userIframe = $state(null);
 
   const languages = [
     { code: "en", name: "English" },
@@ -30,9 +38,63 @@
     { code: "tr", name: "Türkçe" },
   ];
 
+  // ── Iframe postMessage bridge: handle translate requests from translate-iframe ──
+  /** @param {MessageEvent} event */
+  function handleIframeMessage(event) {
+    if (!event.data) return;
+
+    // Iframe changed its target language — keep parent select + backend in sync
+    if (event.data.type === "albion-set-target-lang") {
+      settings.targetLanguage = event.data.lang;
+      saveSettings(settings);
+      invoke("set_target_language", { lang: event.data.lang }).catch((e) =>
+        console.error("Failed to set target language from iframe:", e)
+      );
+      return;
+    }
+
+    if (event.data.type !== "albion-translate") return;
+    const { id, text, targetLang } = event.data;
+
+    // invoke can throw synchronously outside Tauri (or on a bad payload) —
+    // always answer the iframe so it never hangs waiting on its 15s timeout
+    let promise;
+    try {
+      promise = invoke("translate_user_text", { text, sourceLang: null, targetLang });
+    } catch (e) {
+      promise = Promise.reject(e);
+    }
+
+    // Respond on the IFRAME's window — window.postMessage broadcast does NOT
+    // reach same-origin iframes (verified empirically; postMessage only delivers
+    // to the target window object it's called on)
+    /** @type {(payload: { result?: string, error?: string }) => void} */
+    const reply = (payload) => {
+      userIframe?.contentWindow?.postMessage(
+        { type: "albion-translate-result", id, ...payload },
+        "*"
+      );
+    };
+
+    promise
+      .then((result) => reply({ result }))
+      .catch((e) => reply({ error: String(e) }));
+  }
+
+  // Push current theme colors into the sandboxed iframe (CSS vars don't cross frames)
+  function pushThemeToIframe() {
+    const theme = getTheme(currentTheme);
+    if (!userIframe?.contentWindow) return;
+    userIframe.contentWindow.postMessage({ type: "albion-theme", colors: theme.colors }, "*");
+  }
+
   onMount(async () => {
     applyTheme(currentTheme);
     applySettings(settings);
+
+    // Iframe bridge first — independent of Tauri listen/invoke state, so the
+    // translator chatbox keeps working even if a capture listener fails to attach
+    window.addEventListener("message", handleIframeMessage);
 
     try {
       isCapturing = await invoke("get_capture_status");
@@ -56,24 +118,29 @@
   onDestroy(() => {
     if (unlisten) unlisten();
     if (unlistenLocked) unlistenLocked();
+    window.removeEventListener("message", handleIframeMessage);
   });
 
+  /** @param {import("$lib/license.js").LicenseStatus} s */
   function onLicenseActivated(s) {
     license = s;
   }
 
   const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "Trade", "LFG", "Faction", "Unknown"];
 
+  /** @param {string} channel */
   function toggleChannelFilter(channel) {
     settings.channelFilters[channel] = !settings.channelFilters[channel];
     saveSettings(settings);
   }
 
+  /** @param {boolean} on */
   function setAllChannelFilters(on) {
     for (const ch of FILTER_CHANNELS) settings.channelFilters[ch] = on;
     saveSettings(settings);
   }
 
+  /** @param {ChatMessage[]} list */
   function visibleMessages(list) {
     return list.filter((m) => settings.channelFilters[m.channel] !== false);
   }
@@ -106,11 +173,13 @@
     messages = [];
   }
 
+  /** @param {string} themeId */
   function selectTheme(themeId) {
     currentTheme = themeId;
     settings.theme = themeId;
     applyTheme(themeId);
     saveSettings(settings);
+    pushThemeToIframe();
     showThemePicker = false;
   }
 
@@ -119,7 +188,9 @@
     saveSettings(settings);
   }
 
+  /** @param {string} channel */
   function getChannelColor(channel) {
+    /** @type {Record<string, string>} */
     const colors = {
       Say: "var(--text-primary)",
       Whisper: "#ff69b4",
@@ -296,6 +367,16 @@
     <button class="chip util" onclick={() => setAllChannelFilters(false)} title="Hide all channels">None</button>
   </div>
 
+  <!-- User translator iframe -->
+  <iframe
+    src="/translate-iframe"
+    bind:this={userIframe}
+    class="user-translate-iframe"
+    title="User translator"
+    sandbox="allow-same-origin allow-scripts allow-forms"
+    onload={pushThemeToIframe}
+  ></iframe>
+
   <!-- Chat messages -->
   <div class="chat-container" style="font-size: {settings.fontSize}px">
     {#if visibleMessages(messages).length === 0}
@@ -362,6 +443,16 @@
     overflow: hidden;
     color: var(--text-primary);
     position: relative;
+  }
+
+  .user-translate-iframe {
+    width: 100%;
+    height: 140px;
+    border: none;
+    border-top: 1px solid var(--border-color);
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-secondary);
+    flex-shrink: 0;
   }
 
   .title-bar {
