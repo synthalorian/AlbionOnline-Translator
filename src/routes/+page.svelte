@@ -5,6 +5,7 @@
   import { themes, themeCategories, getTheme, applyTheme, getStoredTheme } from "$lib/themes.js";
   import { loadSettings, saveSettings, applySettings } from "$lib/settings.js";
   import { loadLicenseStatus } from "$lib/license.js";
+  import { languages } from "$lib/languages.js";
   import LicenseGate from "$lib/LicenseGate.svelte";
 
   let settings = $state(loadSettings());
@@ -24,19 +25,6 @@
   let license = $state(null);
   /** @type {HTMLIFrameElement | null} */
   let userIframe = $state(null);
-
-  const languages = [
-    { code: "en", name: "English" },
-    { code: "es", name: "Español" },
-    { code: "pt", name: "Português" },
-    { code: "zh", name: "中文" },
-    { code: "ru", name: "Русский" },
-    { code: "de", name: "Deutsch" },
-    { code: "fr", name: "Français" },
-    { code: "ko", name: "한국어" },
-    { code: "ja", name: "日本語" },
-    { code: "tr", name: "Türkçe" },
-  ];
 
   // ── Iframe postMessage bridge: handle translate requests from translate-iframe ──
   /** @param {MessageEvent} event */
@@ -166,6 +154,53 @@
       saveSettings(settings);
     } catch (e) {
       console.error("Language change failed:", e);
+    }
+  }
+
+  // ── Searchable language picker ──
+  let langOpen = $state(false);
+  let langQuery = $state("");
+  /** @type {HTMLInputElement | null} */
+  let langSearchInput = $state(null);
+
+  /** @returns {string} Display name for the current target language */
+  function currentLangName() {
+    return (
+      languages.find((l) => l.code === settings.targetLanguage)?.name ??
+      settings.targetLanguage
+    );
+  }
+
+  const filteredLanguages = $derived(
+    languages.filter((l) => {
+      const q = langQuery.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        l.name.toLowerCase().includes(q) || l.code.toLowerCase().includes(q)
+      );
+    })
+  );
+
+  function openLangPicker() {
+    langQuery = "";
+    langOpen = true;
+    // Focus the search box after the panel renders
+    requestAnimationFrame(() => langSearchInput?.focus());
+  }
+
+  /** @param {string} code */
+  function selectLang(code) {
+    settings.targetLanguage = code;
+    langOpen = false;
+    changeLanguage();
+  }
+
+  /** @param {KeyboardEvent} e */
+  function onLangKeydown(e) {
+    if (e.key === "Escape") {
+      langOpen = false;
+    } else if (e.key === "Enter" && filteredLanguages.length > 0) {
+      selectLang(filteredLanguages[0].code);
     }
   }
 
@@ -344,11 +379,41 @@
     <span class="status {isCapturing ? 'online' : 'offline'}">
       {isCapturing ? "● CAPTURING" : "○ IDLE"}
     </span>
-    <select bind:value={settings.targetLanguage} onchange={changeLanguage} class="lang-select">
-      {#each languages as lang}
-        <option value={lang.code}>{lang.name}</option>
-      {/each}
-    </select>
+    <div class="lang-picker">
+      <button
+        class="lang-select"
+        onclick={() => (langOpen ? (langOpen = false) : openLangPicker())}
+        title="Target language (click to search)"
+      >
+        {currentLangName()}
+      </button>
+      {#if langOpen}
+        <div class="lang-panel">
+          <input
+            bind:this={langSearchInput}
+            bind:value={langQuery}
+            class="lang-search"
+            placeholder="Search language…"
+            onkeydown={onLangKeydown}
+          />
+          <div class="lang-list">
+            {#if filteredLanguages.length === 0}
+              <div class="lang-empty">No matches</div>
+            {:else}
+              {#each filteredLanguages as lang (lang.code)}
+                <button
+                  class="lang-item {lang.code === settings.targetLanguage ? 'active' : ''}"
+                  onclick={() => selectLang(lang.code)}
+                >
+                  <span class="lang-item-name">{lang.name}</span>
+                  <span class="lang-item-code">{lang.code}</span>
+                </button>
+              {/each}
+            {/if}
+          </div>
+        </div>
+      {/if}
+    </div>
   </div>
 
   <!-- Channel filter bar -->
@@ -690,6 +755,10 @@
     color: var(--status-offline);
   }
 
+  .lang-picker {
+    position: relative;
+  }
+
   .lang-select {
     appearance: none;
     -webkit-appearance: none;
@@ -699,15 +768,96 @@
     color: var(--text-primary);
     padding: 4px 24px 4px 8px;
     font-size: 12px;
+    font-family: inherit;
     cursor: pointer;
     outline: none;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23f0e0ff'/%3E%3C/svg%3E");
     background-repeat: no-repeat;
     background-position: right 8px center;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
-  .lang-select:focus {
+  .lang-select:hover {
     border-color: var(--border-glow);
+  }
+
+  .lang-panel {
+    position: absolute;
+    top: calc(100% + 4px);
+    right: 0;
+    min-width: 220px;
+    max-height: 320px;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    z-index: 200;
+    overflow: hidden;
+  }
+
+  .lang-search {
+    appearance: none;
+    -webkit-appearance: none;
+    background: var(--bg-primary);
+    border: none;
+    border-bottom: 1px solid var(--border-color);
+    color: var(--text-primary);
+    padding: 8px 10px;
+    font-size: 12px;
+    font-family: inherit;
+    outline: none;
+  }
+
+  .lang-search:focus {
+    border-bottom-color: var(--border-glow);
+  }
+
+  .lang-list {
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .lang-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+    padding: 6px 10px;
+    background: transparent;
+    border: none;
+    color: var(--text-primary);
+    font-size: 12px;
+    font-family: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .lang-item:hover {
+    background: var(--bg-secondary);
+  }
+
+  .lang-item.active {
+    color: var(--accent-primary);
+    font-weight: 600;
+  }
+
+  .lang-item-code {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+  }
+
+  .lang-empty {
+    padding: 10px;
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
   }
 
   .filter-bar {
