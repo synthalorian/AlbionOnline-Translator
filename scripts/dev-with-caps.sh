@@ -55,7 +55,12 @@ trap 'kill $WATCHER_PID 2>/dev/null || true' EXIT
 # source (starts with `<script>`), which postcss chokes on as "Unknown word
 # onMount" — a red overlay in the webview on every first boot. Curling the
 # style module forces the svelte plugin to transform it, closing the race.
-npm run tauri dev &
+#
+# The `--runner` flag replaces cargo with run-with-caps.sh, which builds,
+# applies setcap caps synchronously, THEN spawns the binary — closing the
+# rebuild-wipes-caps race that a polling watcher can never win.
+RUNNER="$(cd "$(dirname "$0")" && pwd)/run-with-caps.sh"
+npm run tauri dev -- --runner "$RUNNER" &
 NPM_PID=$!
 for _ in $(seq 1 60); do
   if curl -fsS -o /dev/null \
