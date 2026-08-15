@@ -59,9 +59,13 @@ We accept this: 98% of Albion players can't, and the $9.99 price point is below 
 hassle threshold. Do NOT add phone-home DRM beyond the 24h revalidation + 7-day grace —
 being draconian to paying users costs more than piracy does.
 
-## Dependency note
+## Dependency note — RESOLVED 2026-08-12
 
-`albion-network-lib` (beemerwt) currently has NO LICENSE file. License request issue:
+`albion-network-lib` (beemerwt) dependency was dropped (commit 03c47c5). Packet
+decoding is now our own `src-tauri/src/photon.rs` — a Photon Protocol18
+implementation (public protocol spec). The unlicensed-repo blocker is gone;
+the license request issue is moot:
 https://github.com/beemerwt/albion-network-lib/issues/1
-Do not ship commercially until that's resolved (MIT/Apache requested) or the decode
-path is replaced.
+
+Remaining ship blockers live in the checklist above: LS account, BUY_URL,
+release-build verification, Windows installer.
