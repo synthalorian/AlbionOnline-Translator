@@ -202,12 +202,17 @@ impl PacketSniffer {
     async fn convert_message(msg: &photon::ChatMessage, translator: &mut TranslationEngine) -> photon::ChatMessage {
         let source_lang = translator.detect_language(&msg.text);
 
-        let translated_text = if let Some(ref src) = source_lang {
-            if src != translator.target_language() {
-                translator.translate(&msg.text, Some(src)).await
-            } else {
-                None
-            }
+        // Only skip when we're confident it's already the target language.
+        // When lingua can't decide (guild spam full of tags/symbols), still
+        // translate — Google's sl=auto detects on its side and handles the
+        // noisy texts lingua gives up on.
+        let should_translate = source_lang
+            .as_deref()
+            .map(|src| src != translator.target_language())
+            .unwrap_or(true);
+
+        let translated_text = if should_translate {
+            translator.translate(&msg.text, source_lang.as_deref()).await
         } else {
             None
         };

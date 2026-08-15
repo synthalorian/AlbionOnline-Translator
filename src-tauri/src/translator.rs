@@ -80,7 +80,13 @@ impl TranslationEngine {
             target_language: "en".to_string(),
             cache: HashMap::new(),
             google_api_key,
-            http_client: reqwest::Client::new(),
+            // Bounded timeout: the translation worker is a single sequential
+            // loop — one hung request would silently kill translation for the
+            // whole session. 5s is generous for the gtx endpoint.
+            http_client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
             detector,
             model_dir,
             ct2_translator,
