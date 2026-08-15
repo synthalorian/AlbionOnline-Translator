@@ -237,6 +237,7 @@ impl PacketSniffer {
         photon::ChatMessage {
             timestamp: msg.timestamp.clone(),
             channel: msg.channel.clone(),
+            channel_id: msg.channel_id,
             sender: msg.sender.clone(),
             text: msg.text.clone(),
             source_lang,
