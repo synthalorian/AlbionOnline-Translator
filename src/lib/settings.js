@@ -23,6 +23,7 @@ const defaultSettings = {
     Global: true,
     Trade: true,
     LFG: true,
+    Recruitment: true,
     Faction: true,
     Unknown: true,
   },

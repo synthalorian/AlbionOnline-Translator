@@ -25,6 +25,7 @@ pub enum ChatChannel {
     Global,
     Trade,
     LFG,
+    Recruitment,
     Faction,
     Unknown,
 }
@@ -40,6 +41,7 @@ impl std::fmt::Display for ChatChannel {
             ChatChannel::Global => write!(f, "Global"),
             ChatChannel::Trade => write!(f, "Trade"),
             ChatChannel::LFG => write!(f, "LFG"),
+            ChatChannel::Recruitment => write!(f, "Recruitment"),
             ChatChannel::Faction => write!(f, "Faction"),
             ChatChannel::Unknown => write!(f, "Unknown"),
         }
@@ -47,15 +49,56 @@ impl std::fmt::Display for ChatChannel {
 }
 
 impl ChatChannel {
-    /// Maps the client-side chat index (carried in JoinedChatChannel events as
-    /// param 0) to a channel. Values verified against albion-network-lib
-    /// `from_chat_index`; unknown indices default to Say like the reference.
-    fn from_chat_index(index: i64) -> ChatChannel {
-        match index {
-            27 => ChatChannel::Say,
-            24 => ChatChannel::Guild,
-            29 => ChatChannel::Faction,
-            _ => ChatChannel::Say,
+    /// Maps the JoinedChatChannel (207) param-0 value — a channel-TYPE enum —
+    /// to a channel. Table ported from AlbionOnline-Companion's
+    /// ChatChannelTracker::MapChatIndex, verified against live captures
+    /// 2026-08-11 (typeEnum 8 joined runtime id 2 = Trade, 2 → 18 =
+    /// Recruitment, 3 → 19 = LFG). Unknown enums stay Unknown; the caller
+    /// falls back to the channel name Albion also sends in param 2.
+    fn from_type_enum(type_enum: i64) -> ChatChannel {
+        match type_enum {
+            2 => ChatChannel::Recruitment, // verified: joined runtime 18
+            3 => ChatChannel::LFG,         // verified: joined runtime 19
+            5 => ChatChannel::Global,      // verified: joined runtime 21
+            7 => ChatChannel::Faction,     // inferred (runtime 22, unverified)
+            8 => ChatChannel::Trade,       // verified: joined runtime 2
+            24 => ChatChannel::Guild,      // high dynamic runtime id
+            25 => ChatChannel::Alliance,   // high dynamic runtime id
+            26 => ChatChannel::Party,      // inferred by 24/25 sequence
+            27 => ChatChannel::Say,        // zone-local, dynamic per cluster
+            _ => ChatChannel::Unknown,
+        }
+    }
+
+    /// Last-resort channel typing from the name string Albion sends in
+    /// JoinedChatChannel param 2 (e.g. "LFG", "Faction - Caerleon").
+    fn from_channel_name(name: &str) -> ChatChannel {
+        let n = name.trim().to_lowercase();
+        if n.is_empty() {
+            return ChatChannel::Unknown;
+        }
+        if n.contains("lfg") || n.contains("looking") {
+            ChatChannel::LFG
+        } else if n.contains("recruit") {
+            ChatChannel::Recruitment
+        } else if n.contains("trade") {
+            ChatChannel::Trade
+        } else if n.contains("faction") {
+            ChatChannel::Faction
+        } else if n.contains("guild") {
+            ChatChannel::Guild
+        } else if n.contains("alliance") {
+            ChatChannel::Alliance
+        } else if n.contains("party") || n.contains("group") {
+            ChatChannel::Party
+        } else if n.contains("global") || n.contains("english") || n.contains("international") {
+            ChatChannel::Global
+        } else if n.contains("say") || n.contains("local") {
+            ChatChannel::Say
+        } else if n.contains("whisper") {
+            ChatChannel::Whisper
+        } else {
+            ChatChannel::Unknown
         }
     }
 }
@@ -188,12 +231,34 @@ impl PhotonDecoder {
         let payload = &data[2..];
 
         match msg_type {
-            MESSAGE_OPERATION_REQUEST => None,  // client->server, not needed for chat display
+            MESSAGE_OPERATION_REQUEST => self.decode_operation_request(payload),
             MESSAGE_OPERATION_RESPONSE => None, // server->client, not needed for chat display
             MESSAGE_EVENT => self.decode_event(payload),
             MESSAGE_ENCRYPTED => None,
             _ => None,
         }
+    }
+
+    /// Outbound (client->server) operations. SendChatMessage (189) is how the
+    /// LOCAL player's own chat travels — decoding it is the only way to show
+    /// your own messages, since the server doesn't echo them back as events.
+    /// Payload structure is not documented in any reference implementation,
+    /// so we dump raw params for reverse engineering first.
+    fn decode_operation_request(&mut self, data: &[u8]) -> Option<ChatMessage> {
+        if data.len() < 2 {
+            return None;
+        }
+        let params = self.deserialize_parameter_table(&mut Reader::new(&data[1..]))?;
+        let op_code = value_i64(&params, 253)?;
+        // 188 = RegisterChatPeer, 189 = SendChatMessage, 194 = Say (operation_codes.rs)
+        if matches!(op_code, 188 | 189 | 194) {
+            let raw = serde_json::to_string(&params_to_value(
+                params.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            ))
+            .unwrap_or_else(|_| "<unserializable>".to_string());
+            info!("Outbound chat op {} raw params: {}", op_code, raw);
+        }
+        None
     }
 
     fn decode_event(&mut self, data: &[u8]) -> Option<ChatMessage> {
@@ -257,19 +322,28 @@ impl PhotonDecoder {
     }
 
     fn handle_joined_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
-        // JoinedChatChannel (207): param 0 = chat_index (u8), param 1 = channel_id (i64)
-        let chat_index = value_i64(params, 0);
-        let channel_id = value_i64(params, 1);
-        let (Some(chat_index), Some(channel_id)) = (chat_index, channel_id) else {
+        // JoinedChatChannel (207), semantics verified against live captures via
+        // AlbionOnline-Companion's ChatChannelTracker (2026-08-11):
+        //   param 0 = channel-TYPE enum (2=Recruitment, 3=LFG, 5=Global,
+        //             8=Trade, 24=Guild, 25=Alliance, 26=Party, 27=Say)
+        //   param 1 = RUNTIME channel id — the key ChatMessage events use
+        //   param 2 = channel name string ("LFG", "Faction - Caerleon", ...)
+        let type_enum = value_i64(params, 0);
+        let runtime_id = value_i64(params, 1);
+        let (Some(type_enum), Some(runtime_id)) = (type_enum, runtime_id) else {
             debug!("JoinedChatChannel with missing params: {:?}", params);
             return;
         };
-        let channel = ChatChannel::from_chat_index(chat_index);
+        let name = params.get(&2).and_then(|v| v.as_str()).unwrap_or("");
+        let mut channel = ChatChannel::from_type_enum(type_enum);
+        if channel == ChatChannel::Unknown {
+            channel = ChatChannel::from_channel_name(name);
+        }
         info!(
-            "Chat channel joined: id={} index={} -> {}",
-            channel_id, chat_index, channel
+            "Chat channel joined: runtime={} type_enum={} name={:?} -> {}",
+            runtime_id, type_enum, name, channel
         );
-        self.channel_map.insert(channel_id, channel);
+        self.channel_map.insert(runtime_id, channel);
     }
 
     fn handle_left_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
@@ -351,14 +425,20 @@ impl PhotonDecoder {
     }
 
     fn map_channel(&self, channel_id: i64) -> ChatChannel {
-        // Session-assigned channel_ids only resolve through the live map built
-        // from JoinedChatChannel (207) events; the static fallback below covers
-        // the few well-known ids the reference lib hardcodes.
+        // Resolution order: live map (207 joins) → static well-known ids →
+        // Unknown. Static table merges albion-network-lib's faction ids with
+        // the companion's capture-verified globals (Trade=2, Recruitment=18,
+        // LFG=19, Global=21 — "RECLUTA" spam on 18, "busco party" on 19).
         if let Some(channel) = self.channel_map.get(&channel_id) {
             return *channel;
         }
         match channel_id {
             0 => ChatChannel::Say,
+            1 => ChatChannel::Global,
+            2 => ChatChannel::Trade,
+            18 => ChatChannel::Recruitment,
+            19 => ChatChannel::LFG,
+            21 => ChatChannel::Global,
             3517 => ChatChannel::Guild,
             1868 => ChatChannel::Faction, // Thetford
             1856 => ChatChannel::Faction, // Martlock
@@ -366,7 +446,7 @@ impl PhotonDecoder {
             1858 => ChatChannel::Faction, // Lymhurst
             1859 => ChatChannel::Faction, // Fort Sterling
             1860 => ChatChannel::Faction, // Caerleon
-            _ => ChatChannel::Say,        // default to Say (matching ref) rather than Unknown
+            _ => ChatChannel::Unknown, // honest label until a 207 resolves it
         }
     }
 
@@ -1043,15 +1123,17 @@ mod tests {
         let msg = decoder
             .decode(&build_chat_packet(73, &msg_params))
             .expect("chat message after leave");
-        assert_eq!(msg.channel, ChatChannel::Say);
+        // After leaving, runtime id 84 has no live mapping and no static
+        // entry — honest Unknown, not a misleading Say.
+        assert_eq!(msg.channel, ChatChannel::Unknown);
     }
 
     #[test]
-    fn unknown_chat_index_defaults_to_say() {
-        // A JoinedChatChannel with an unmapped chat_index (e.g. 30) resolves
-        // to Say, matching albion-network-lib's fallback behavior.
+    fn unknown_type_enum_resolves_to_unknown() {
+        // A JoinedChatChannel with an unmapped type enum (e.g. 30) and no
+        // channel name param resolves to Unknown.
         let join_params = [
-            0x02, 0x00, 0x0B, 30, 0x01, 0x0A, 0x54, // index 30 (unmapped), id 42
+            0x02, 0x00, 0x0B, 30, 0x01, 0x0A, 0x54, // type enum 30 (unmapped), runtime id 84
         ];
         let mut decoder = PhotonDecoder::new();
         decoder.decode(&build_chat_packet(207, &join_params));
@@ -1063,7 +1145,7 @@ mod tests {
         let msg = decoder
             .decode(&build_chat_packet(73, &msg_params))
             .expect("chat message with unmapped index");
-        assert_eq!(msg.channel, ChatChannel::Say);
+        assert_eq!(msg.channel, ChatChannel::Unknown);
     }
 
     #[test]
