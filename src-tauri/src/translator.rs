@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
+use rusqlite::Connection;
+use std::sync::Mutex as StdMutex;
 
 /// Translation engine with pluggable backends
 /// Priority: CTranslate2 (local) > Google Translate (free, no key) > fallback tag
@@ -41,11 +43,14 @@ struct GoogleTranslation {
 pub struct TranslationEngine {
     target_language: String,
     cache: HashMap<String, String>,
+    db: Option<StdMutex<Connection>>,
     google_api_key: Option<String>,
     http_client: reqwest::Client,
     detector: LanguageDetector,
     model_dir: PathBuf,
-    ct2_translator: Option<ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>>,
+    /// CTranslate2 translators keyed by source language code (e.g. "es", "pt").
+    /// Each model translates FROM that language TO the target (currently always English).
+    ct2_translators: HashMap<String, ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>>,
 }
 
 impl TranslationEngine {
@@ -74,11 +79,12 @@ impl TranslationEngine {
 
         // Look for CTranslate2 models
         let model_dir = Self::find_model_dir();
-        let ct2_translator = Self::load_ct2_model(&model_dir);
+        let ct2_translators = Self::load_ct2_models(&model_dir);
 
         Self {
             target_language: "en".to_string(),
             cache: HashMap::new(),
+            db: Self::init_cache_db().map(StdMutex::new),
             google_api_key,
             // Bounded timeout: the translation worker is a single sequential
             // loop — one hung request would silently kill translation for the
@@ -89,7 +95,62 @@ impl TranslationEngine {
                 .unwrap_or_else(|_| reqwest::Client::new()),
             detector,
             model_dir,
-            ct2_translator,
+            ct2_translators,
+        }
+    }
+
+    /// Initialize SQLite translation cache at ~/.cache/albion-translator/cache.db.
+    /// In-memory HashMap is the hot path; SQLite is the persistent backing store.
+    fn init_cache_db() -> Option<Connection> {
+        let cache_dir = dirs::cache_dir()?
+            .join("albion-translator");
+        std::fs::create_dir_all(&cache_dir).ok()?;
+        let db_path = cache_dir.join("cache.db");
+        let conn = Connection::open(&db_path).ok()?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS translations (
+                key TEXT PRIMARY KEY,
+                translated TEXT NOT NULL,
+                created_at INTEGER DEFAULT (unixepoch())
+            );
+            CREATE INDEX IF NOT EXISTS idx_created ON translations(created_at);"
+        ).ok()?;
+        info!("Translation cache DB opened at {:?}", db_path);
+        Some(conn)
+    }
+
+    /// Look up a translation in the cache (memory first, then SQLite).
+    fn cache_get(&self, key: &str) -> Option<String> {
+        // Hot path: in-memory
+        if let Some(cached) = self.cache.get(key) {
+            return Some(cached.clone());
+        }
+        // Cold path: SQLite
+        if let Some(ref db) = self.db {
+            if let Ok(db) = db.lock() {
+                let result: Result<String, _> = db.query_row(
+                    "SELECT translated FROM translations WHERE key = ?1",
+                    [key],
+                    |row| row.get(0),
+                );
+                if let Ok(translated) = result {
+                    return Some(translated);
+                }
+            }
+        }
+        None
+    }
+
+    /// Store a translation in both memory and SQLite.
+    fn cache_insert(&mut self, key: String, translated: String) {
+        self.cache.insert(key.clone(), translated.clone());
+        if let Some(ref db) = self.db {
+            if let Ok(db) = db.lock() {
+                db.execute(
+                    "INSERT OR REPLACE INTO translations (key, translated) VALUES (?1, ?2)",
+                    [&key, &translated],
+                ).ok();
+            }
         }
     }
 
@@ -121,29 +182,34 @@ impl TranslationEngine {
         PathBuf::from("models")
     }
 
-    fn load_ct2_model(model_dir: &PathBuf) -> Option<ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>> {
-        // Try to load es-en model as default
-        let model_path = model_dir.join("opus-mt-es-en-ct2");
-
-        if !model_path.exists() {
-            info!(
-                "No CTranslate2 model found at {:?}, local translation disabled",
-                model_path
-            );
-            return None;
-        }
-
-        let config = ct2rs::Config::default();
-        match ct2rs::Translator::new(&model_path, &config) {
-            Ok(translator) => {
-                info!("Loaded CTranslate2 model from {:?}", model_path);
-                Some(translator)
+    /// Load all available CTranslate2 models from the model directory.
+    /// Each model is named "opus-mt-{src}-en-ct2" (e.g. opus-mt-es-en-ct2).
+    /// Returns a map of source language code → translator.
+    fn load_ct2_models(model_dir: &PathBuf) -> HashMap<String, ct2rs::Translator<ct2rs::tokenizers::auto::Tokenizer>> {
+        let mut translators = HashMap::new();
+        let supported = ["es", "pt", "ru", "zh", "ko", "ja", "de", "fr", "tr", "ar"];
+        for src in &supported {
+            let model_path = model_dir.join(format!("opus-mt-{}-en-ct2", src));
+            if !model_path.exists() {
+                continue;
             }
-            Err(e) => {
-                warn!("Failed to load CTranslate2 model: {}", e);
-                None
+            let config = ct2rs::Config::default();
+            match ct2rs::Translator::new(&model_path, &config) {
+                Ok(translator) => {
+                    info!("Loaded CTranslate2 model: {} → en", src);
+                    translators.insert(src.to_string(), translator);
+                }
+                Err(e) => {
+                    warn!("Failed to load CTranslate2 model {}: {}", src, e);
+                }
             }
         }
+        if translators.is_empty() {
+            info!("No CTranslate2 models found in {:?}, local translation disabled", model_dir);
+        } else {
+            info!("Loaded {} CTranslate2 models", translators.len());
+        }
+        translators
     }
 
     pub fn set_target_language(&mut self, lang: &str) {
@@ -155,9 +221,9 @@ impl TranslationEngine {
         &self.target_language
     }
 
-    /// Check if local translation is available
+    /// Check if local translation is available for any language
     pub fn has_local_translation(&self) -> bool {
-        self.ct2_translator.is_some()
+        !self.ct2_translators.is_empty()
     }
 
     /// Translate with an explicit target language (per-call, doesn't mutate engine state).
@@ -193,21 +259,23 @@ impl TranslationEngine {
             trimmed
         );
 
-        if let Some(cached) = self.cache.get(&cache_key) {
+        if let Some(cached) = self.cache_get(&cache_key) {
             debug!("Cache hit for: {}", trimmed);
             return Some(cached.clone());
         }
 
-        // Try CTranslate2 for es→en if model is loaded
-        if let Some(ref translator) = self.ct2_translator {
-            if target_lang == "en" {
-                match self.translate_ct2(translator, trimmed, detected.as_deref()).await {
-                    Ok(translated) => {
-                        self.cache.insert(cache_key, translated.clone());
-                        return Some(translated);
-                    }
-                    Err(e) => {
-                        debug!("CTranslate2 failed: {}", e);
+        // Try CTranslate2 if we have a model for the detected source language
+        if target_lang == "en" {
+            if let Some(ref det) = detected {
+                if let Some(translator) = self.ct2_translators.get(det.as_str()) {
+                    match self.translate_ct2(translator, trimmed, Some(det)).await {
+                        Ok(translated) => {
+                            self.cache_insert(cache_key, translated.clone());
+                            return Some(translated);
+                        }
+                        Err(e) => {
+                            debug!("CTranslate2 failed: {}", e);
+                        }
                     }
                 }
             }
@@ -223,7 +291,7 @@ impl TranslationEngine {
                     trimmed,
                     translated
                 );
-                self.cache.insert(cache_key, translated.clone());
+                self.cache_insert(cache_key, translated.clone());
                 return Some(translated);
             }
             Err(e) => {
@@ -234,7 +302,7 @@ impl TranslationEngine {
         // Fallback: return original with language tag
         let lang_tag = detected.unwrap_or_else(|| "unknown".to_string());
         let fallback = format!("[{}] {}", lang_tag, trimmed);
-        self.cache.insert(cache_key, fallback.clone());
+        self.cache_insert(cache_key, fallback.clone());
         Some(fallback)
     }
 
@@ -269,20 +337,22 @@ impl TranslationEngine {
             trimmed
         );
 
-        if let Some(cached) = self.cache.get(&cache_key) {
+        if let Some(cached) = self.cache_get(&cache_key) {
             debug!("Cache hit for: {}", trimmed);
             return Some(cached.clone());
         }
 
-        // Try CTranslate2 first (free, local) — currently es→en only
-        if let Some(ref translator) = self.ct2_translator {
-            match self.translate_ct2(translator, trimmed, detected.as_deref()).await {
-                Ok(translated) => {
-                    self.cache.insert(cache_key, translated.clone());
-                    return Some(translated);
-                }
-                Err(e) => {
-                    debug!("CTranslate2 failed: {}", e);
+        // Try CTranslate2 if we have a model for the detected source language
+        if let Some(ref det) = detected {
+            if let Some(translator) = self.ct2_translators.get(det.as_str()) {
+                match self.translate_ct2(translator, trimmed, Some(det)).await {
+                    Ok(translated) => {
+                        self.cache_insert(cache_key, translated.clone());
+                        return Some(translated);
+                    }
+                    Err(e) => {
+                        debug!("CTranslate2 failed: {}", e);
+                    }
                 }
             }
         }
@@ -297,7 +367,7 @@ impl TranslationEngine {
                     trimmed,
                     translated
                 );
-                self.cache.insert(cache_key, translated.clone());
+                self.cache_insert(cache_key, translated.clone());
                 return Some(translated);
             }
             Err(e) => {
@@ -308,7 +378,7 @@ impl TranslationEngine {
         // Fallback: return original with language tag
         let lang_tag = detected.unwrap_or_else(|| "unknown".to_string());
         let fallback = format!("[{}] {}", lang_tag, trimmed);
-        self.cache.insert(cache_key, fallback.clone());
+        self.cache_insert(cache_key, fallback.clone());
         Some(fallback)
     }
 
