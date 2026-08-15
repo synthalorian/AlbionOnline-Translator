@@ -9,6 +9,7 @@ use tracing::{debug, info, trace};
 pub struct ChatMessage {
     pub timestamp: String,
     pub channel: ChatChannel,
+    pub channel_id: i64,
     pub sender: String,
     pub text: String,
     pub source_lang: Option<String>,
@@ -62,6 +63,9 @@ impl ChatChannel {
     /// falls back to the channel name Albion also sends in param 2.
     fn from_type_enum(type_enum: i64) -> ChatChannel {
         match type_enum {
+            // Live-verified 2026-08-15: type enum 1 joins runtime id 17 = Trade
+            // (WTS/WTB messages). Companion had this unmapped.
+            1 => ChatChannel::Trade,
             2 => ChatChannel::Recruitment, // verified: joined runtime 18
             3 => ChatChannel::LFG,         // verified: joined runtime 19
             5 => ChatChannel::Global,      // verified: joined runtime 21
@@ -466,8 +470,8 @@ impl PhotonDecoder {
         // dynamic runtime ids we haven't mapped yet (missed 206 roster).
         if channel == ChatChannel::Unknown && channel_id > 100 {
             info!(
-                "ChatMessage on unmapped high-id channel {}: sender={} text={:?} — \
-                 likely guild/party/alliance (relog after starting capture to map)",
+                "Unmapped channel {}: sender={} text={:?} — \
+                 relog with capture running to map guild/party/alliance",
                 channel_id, player_name, message
             );
         }
@@ -481,6 +485,7 @@ impl PhotonDecoder {
         Some(ChatMessage {
             timestamp: now.format("%H:%M:%S").to_string(),
             channel,
+            channel_id,
             sender: player_name,
             text: message,
             source_lang: None,
@@ -501,6 +506,7 @@ impl PhotonDecoder {
         Some(ChatMessage {
             timestamp: now.format("%H:%M:%S").to_string(),
             channel: ChatChannel::Say,
+            channel_id: 0,
             sender: player_name,
             text: message,
             source_lang: None,
@@ -521,6 +527,7 @@ impl PhotonDecoder {
         Some(ChatMessage {
             timestamp: now.format("%H:%M:%S").to_string(),
             channel: ChatChannel::Whisper,
+            channel_id: -1,
             sender: player_name,
             text: message,
             source_lang: None,
@@ -542,6 +549,9 @@ impl PhotonDecoder {
             // Live-verified 2026-08-15: id 2 carries the English language
             // channel. Drop it — language channels don't need translation.
             2 => ChatChannel::Language,
+            // Live-verified 2026-08-15: id 17 = Trade (WTS/WTB messages,
+            // joined via type enum 1).
+            17 => ChatChannel::Trade,
             18 => ChatChannel::Recruitment,
             19 => ChatChannel::LFG,
             21 => ChatChannel::Global,

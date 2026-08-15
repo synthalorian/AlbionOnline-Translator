@@ -11,7 +11,7 @@
   let settings = $state(loadSettings());
   let isCapturing = $state(false);
 
-  /** @typedef {{ timestamp: string, channel: string, sender: string, text: string, source_lang?: string, translated_text?: string }} ChatMessage */
+  /** @typedef {{ timestamp: string, channel: string, channel_id: number, sender: string, text: string, source_lang?: string, translated_text?: string }} ChatMessage */
   /** @type {ChatMessage[]} */
   let messages = $state([]);
   /** @type {(() => void) | null} */
@@ -472,7 +472,7 @@
               <span class="timestamp">{msg.timestamp}</span>
             {/if}
             <span class="channel" style="color: {getChannelColor(msg.channel)}">
-              [{msg.channel}]
+              [{msg.channel === "Unknown" ? `Unknown:${msg.channel_id}` : msg.channel}]
             </span>
             <span class="sender">{msg.sender}</span>
             {#if msg.source_lang && msg.source_lang !== settings.targetLanguage}
