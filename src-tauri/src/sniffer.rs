@@ -18,6 +18,58 @@ const BPF_FILTER: &str = "udp port 5055 or udp port 5056 or udp port 4535";
 
 const DEFAULT_HOSTS_PATH: &str = "hosts.txt";
 
+/// Channel mappings persist across app restarts (same game session = same ids).
+/// Saved to ~/.config/albion-translator/channels.json.
+fn channel_map_path() -> std::path::PathBuf {
+    let dir = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("albion-translator");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("channels.json")
+}
+
+pub fn save_channel_map(map: &HashMap<i64, ChatChannel>) {
+    let path = channel_map_path();
+    // Only save non-Unknown mappings — no point persisting noise
+    let filtered: HashMap<String, String> = map
+        .iter()
+        .filter(|(_, ch)| **ch != ChatChannel::Unknown && **ch != ChatChannel::Language)
+        .map(|(id, ch)| (id.to_string(), ch.to_string()))
+        .collect();
+    if let Ok(json) = serde_json::to_string_pretty(&filtered) {
+        std::fs::write(&path, json).ok();
+    }
+}
+
+pub fn load_channel_map() -> HashMap<i64, ChatChannel> {
+    let path = channel_map_path();
+    let Ok(json) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(raw) = serde_json::from_str::<HashMap<String, String>>(&json) else {
+        return HashMap::new();
+    };
+    raw.iter()
+        .filter_map(|(id, ch)| {
+            let id = id.parse::<i64>().ok()?;
+            let channel = match ch.as_str() {
+                "Local" => ChatChannel::Say,
+                "Whisper" => ChatChannel::Whisper,
+                "Party" => ChatChannel::Party,
+                "Guild" => ChatChannel::Guild,
+                "Alliance" => ChatChannel::Alliance,
+                "Global" => ChatChannel::Global,
+                "Trade" => ChatChannel::Trade,
+                "LFG" => ChatChannel::LFG,
+                "Recruitment" => ChatChannel::Recruitment,
+                "Faction" => ChatChannel::Faction,
+                _ => return None,
+            };
+            Some((id, channel))
+        })
+        .collect()
+}
+
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
     tx: mpsc::Sender<photon::ChatMessage>,
@@ -37,11 +89,17 @@ impl PacketSniffer {
             None
         };
 
+        // Load persisted channel mappings from previous sessions
+        let saved = load_channel_map();
+        if !saved.is_empty() {
+            info!("Loaded {} saved channel mappings", saved.len());
+        }
+
         Self {
             running: Arc::new(AtomicBool::new(false)),
             tx,
             host_filter,
-            channel_map: Arc::new(StdMutex::new(HashMap::new())),
+            channel_map: Arc::new(StdMutex::new(saved)),
         }
     }
 
@@ -214,10 +272,12 @@ impl PacketSniffer {
 
     /// Inject a manual channel mapping from the UI (e.g. user tags Unknown
     /// channel 25813 as Guild). Takes effect immediately for future messages.
+    /// Persisted to disk so it survives app restarts within the same game session.
     pub fn set_channel_mapping(&self, channel_id: i64, channel: ChatChannel) {
         if let Ok(mut map) = self.channel_map.lock() {
             info!("Manual channel mapping: {} -> {}", channel_id, channel);
             map.insert(channel_id, channel);
+            save_channel_map(&map);
         }
     }
 
