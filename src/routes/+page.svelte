@@ -21,6 +21,8 @@
   let currentTheme = $state(settings.theme || getStoredTheme());
   let showThemePicker = $state(false);
   let showSettings = $state(false);
+  let checkingUpdates = $state(false);
+  let updateStatus = $state("");
   /** @type {import("$lib/license.js").LicenseStatus | null} */
   let license = $state(null);
   /** @type {HTMLIFrameElement | null} */
@@ -272,6 +274,19 @@
     messages = [];
   }
 
+  async function checkUpdates() {
+    checkingUpdates = true;
+    updateStatus = "";
+    try {
+      const result = await invoke("check_for_updates");
+      updateStatus = result;
+    } catch (e) {
+      updateStatus = String(e);
+    } finally {
+      checkingUpdates = false;
+    }
+  }
+
   /** @param {string} themeId */
   function selectTheme(themeId) {
     currentTheme = themeId;
@@ -409,6 +424,12 @@
           <input type="checkbox" bind:checked={settings.showTranslated} onchange={updateSettings} />
           <span>Show Translated</span>
         </label>
+      </div>
+
+      <div class="setting-row" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
+        <button class="setup-btn" style="width: 100%;" onclick={checkUpdates} disabled={checkingUpdates}>
+          {checkingUpdates ? "Checking…" : updateStatus || "Check for Updates"}
+        </button>
       </div>
     </div>
   {/if}
