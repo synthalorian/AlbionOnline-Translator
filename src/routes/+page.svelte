@@ -27,18 +27,36 @@
   let userIframe = $state(null);
   /** @type {HTMLDivElement | null} */
   let chatContainer = $state(null);
+  // Scroll freeze: when the user scrolls up, pause auto-scroll. Resumes when
+  // they scroll back to the bottom. Classic chat behavior.
+  let scrollFrozen = $state(false);
 
-  // Auto-scroll chat to bottom when new messages arrive
+  // Auto-scroll chat to bottom when new messages arrive (unless frozen)
   $effect(() => {
     // Depend on messages.length so this fires on every new message
     void messages.length;
-    if (chatContainer) {
+    if (chatContainer && !scrollFrozen) {
       // Use requestAnimationFrame to wait for DOM update
       requestAnimationFrame(() => {
         chatContainer.scrollTop = chatContainer.scrollHeight;
       });
     }
   });
+
+  function onChatScroll() {
+    if (!chatContainer) return;
+    const { scrollTop, scrollHeight, clientHeight } = chatContainer;
+    // Consider "at bottom" if within 30px of the bottom
+    const atBottom = scrollHeight - scrollTop - clientHeight < 30;
+    scrollFrozen = !atBottom;
+  }
+
+  function scrollToBottom() {
+    scrollFrozen = false;
+    if (chatContainer) {
+      chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+  }
 
   // ── Iframe postMessage bridge: handle translate requests from translate-iframe ──
   /** @param {MessageEvent} event */
@@ -474,7 +492,7 @@
   ></iframe>
 
   <!-- Chat messages -->
-  <div class="chat-container" bind:this={chatContainer} style="font-size: {settings.fontSize}px">
+  <div class="chat-container" bind:this={chatContainer} onscroll={onChatScroll} style="font-size: {settings.fontSize}px">
     {#if visibleMessages(messages).length === 0}
       <div class="empty-state">
         <p>{messages.length === 0 ? "No messages yet" : "All messages filtered out"}</p>
@@ -518,6 +536,12 @@
       {/each}
     {/if}
   </div>
+
+  {#if scrollFrozen}
+    <button class="scroll-bottom-btn" onclick={scrollToBottom}>
+      ↓ New messages
+    </button>
+  {/if}
 
   <!-- Footer -->
   <div class="footer">
@@ -951,6 +975,39 @@
     gap: 8px;
   }
 
+  .scroll-bottom-btn {
+    position: absolute;
+    bottom: 60px;
+    right: 16px;
+    padding: 6px 14px;
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+    border: none;
+    border-radius: 16px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+    z-index: 50;
+    transition: opacity 0.2s;
+    animation: slideUp 0.2s ease-out;
+  }
+
+  .scroll-bottom-btn:hover {
+    opacity: 0.9;
+  }
+
+  @keyframes slideUp {
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
   .chat-container::-webkit-scrollbar {
     width: 6px;
   }
@@ -1039,25 +1096,29 @@
 
   .channel-tagger {
     display: inline-flex;
-    gap: 2px;
+    gap: 3px;
+    margin-left: 4px;
   }
 
   .tag-btn {
     background: var(--bg-tertiary);
-    border: 1px solid var(--border-color);
-    border-radius: 3px;
-    padding: 0 4px;
-    font-size: 9px;
-    color: var(--text-muted);
+    border: 1px solid var(--accent-primary);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 10px;
+    color: var(--accent-primary);
     cursor: pointer;
     text-transform: uppercase;
     letter-spacing: 0.3px;
-    transition: color 0.15s, border-color 0.15s;
+    transition: all 0.15s;
+    opacity: 0.7;
   }
 
   .tag-btn:hover {
-    color: var(--accent-primary);
-    border-color: var(--accent-primary);
+    opacity: 1;
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+    box-shadow: 0 0 6px var(--accent-primary);
   }
 
   .message-body {
