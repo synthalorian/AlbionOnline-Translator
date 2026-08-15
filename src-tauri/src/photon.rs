@@ -32,7 +32,7 @@ pub enum ChatChannel {
 impl std::fmt::Display for ChatChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChatChannel::Say => write!(f, "Say"),
+            ChatChannel::Say => write!(f, "Local"),
             ChatChannel::Whisper => write!(f, "Whisper"),
             ChatChannel::Party => write!(f, "Party"),
             ChatChannel::Guild => write!(f, "Guild"),
@@ -350,7 +350,7 @@ impl PhotonDecoder {
             1858 => ChatChannel::Faction, // Lymhurst
             1859 => ChatChannel::Faction, // Fort Sterling
             1860 => ChatChannel::Faction, // Caerleon
-            _ => ChatChannel::Unknown,
+            _ => ChatChannel::Say,        // default to Say (matching ref) rather than Unknown
         }
     }
 
@@ -1004,9 +1004,10 @@ mod tests {
     }
 
     #[test]
-    fn leaves_channel_falls_back_to_unknown() {
+    fn leaves_channel_falls_back_to_static_default() {
         // Join then leave: after LeftChatChannel (208) removes channel 42, a
-        // message on it must fall back to Unknown (no static mapping for 42).
+        // message on it falls back to the static default Say (matching the
+        // reference lib), since 42 has no hardcoded mapping.
         let join_params = [
             0x02, 0x00, 0x0B, 24, 0x01, 0x0A, 0x54, // index 24 (Guild), id 42
         ];
@@ -1026,7 +1027,7 @@ mod tests {
         let msg = decoder
             .decode(&build_chat_packet(73, &msg_params))
             .expect("chat message after leave");
-        assert_eq!(msg.channel, ChatChannel::Unknown);
+        assert_eq!(msg.channel, ChatChannel::Say);
     }
 
     #[test]

@@ -4,26 +4,39 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::{network::extract_udp_payload, photon::PhotonDecoder, translator::TranslationEngine};
+use crate::{network::extract_udp_payload, photon::PhotonDecoder, translator::TranslationEngine, hosts::HostFilter};
 use crate::photon;
 
 // Albion's game UDP ports are stable across the entire server fleet, while
 // the server IPs rotate across many ranges (5.188.125.x, 5.45.187.x,
 // 193.169.238.x, 85.234.70.x all observed live), so an IP whitelist silently
-// drops chat from any range not listed. Filter on ports instead; the decoder
-// still validates payloads, so unrelated traffic on these ports is dropped.
-const ALBION_UDP_FILTER: &str = "udp port 5055 or udp port 5056 or udp port 4535";
+// drops chat from any range not listed. Filter on ports at the BPF level
+// (fast, kernel-side) and on IPs after extraction (user-side, based on
+// hosts.txt CIDR ranges).
+const BPF_FILTER: &str = "udp port 5055 or udp port 5056 or udp port 4535";
+
+const DEFAULT_HOSTS_PATH: &str = "hosts.txt";
 
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
     tx: mpsc::Sender<photon::ChatMessage>,
+    host_filter: Option<HostFilter>,
 }
 
 impl PacketSniffer {
     pub fn new(tx: mpsc::Sender<photon::ChatMessage>) -> Self {
+        // Try to load hosts.txt from the current working directory; if it
+        // doesn't exist or is empty, run unfiltered (backward compat).
+        let host_filter = if std::path::Path::new(DEFAULT_HOSTS_PATH).exists() {
+            HostFilter::from_file(std::path::Path::new(DEFAULT_HOSTS_PATH)).ok()
+        } else {
+            None
+        };
+
         Self {
             running: Arc::new(AtomicBool::new(false)),
             tx,
+            host_filter,
         }
     }
 
@@ -55,6 +68,15 @@ impl PacketSniffer {
 
         info!("Using device: {}", device.name);
 
+        if let Some(ref hf) = self.host_filter {
+            info!(
+                "IP filtering active: {} CIDR range(s)",
+                hf.len()
+            );
+        } else {
+            info!("IP filtering disabled — all UDP on Albion ports will be processed");
+        }
+
         let mut cap = None;
         // cargo rebuilds replace the binary and wipe its setcap caps, so a
         // freshly relaunched app can hit a brief permission window. Retry
@@ -85,14 +107,13 @@ impl PacketSniffer {
         }
         let mut cap = cap.expect("capture open should succeed after retries");
 
-        // See ALBION_UDP_FILTER: the fleet's ports are stable, its IPs are
-        // not, so filter on ports.
-        cap.filter(ALBION_UDP_FILTER, true)
+        cap.filter(BPF_FILTER, true)
             .map_err(|e| SnifferError::Filter(e.to_string()))?;
 
         self.running.store(true, Ordering::SeqCst);
         let running = self.running.clone();
         let tx = self.tx.clone();
+        let host_filter = self.host_filter.clone();
 
         // Raw decoded (untranslated) messages flow into a bounded channel;
         // a dedicated worker translates them off the capture loop so a slow
@@ -115,6 +136,7 @@ impl PacketSniffer {
             let mut decoder = PhotonDecoder::new();
             let mut packet_number = 0usize;
             let mut filtered_count = 0usize;
+            let mut ip_filtered_count = 0usize;
 
             while running.load(Ordering::SeqCst) {
                 match cap.next_packet() {
@@ -125,7 +147,18 @@ impl PacketSniffer {
                         // port filter already gates on Albion's ports; the
                         // decoder below validates structure, so non-Albion
                         // traffic never survives to the channel.
-                        if let Some((_, _, payload)) = extract_udp_payload(packet.data) {
+                        if let Some((src_ip, dst_ip, payload)) = extract_udp_payload(packet.data) {
+                            // Apply IP-based host filtering (hosts.txt CIDR ranges).
+                            // Match either endpoint: inbound chat has the server as
+                            // src, but outbound whispers have it as dst — checking
+                            // only src would silently drop everything you send.
+                            if let Some(ref hf) = host_filter {
+                                if !hf.contains(src_ip) && !hf.contains(dst_ip) {
+                                    ip_filtered_count += 1;
+                                    continue;
+                                }
+                            }
+
                             if let Some(msg) = decoder.decode(payload) {
                                 // Bounded channel = backpressure: if the translator
                                 // is busy, drop further processing instead of
@@ -150,8 +183,8 @@ impl PacketSniffer {
             }
 
             info!(
-                "Packet capture stopped. Total: {}, Filtered: {}",
-                packet_number, filtered_count
+                "Packet capture stopped. Total: {}, Filtered (non-IP): {}, IP-filtered: {}",
+                packet_number, filtered_count, ip_filtered_count
             );
         });
 

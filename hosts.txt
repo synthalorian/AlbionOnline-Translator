@@ -1,0 +1,10 @@
+# Albion Online server IP ranges (CIDR notation, one per line)
+# Lines starting with # are comments. Empty lines are ignored.
+# Add ranges as Albion publishes new server IPs.
+# These ranges are observed from live traffic; update as needed.
+
+# Primary server fleet
+5.188.125.0/24
+5.45.187.0/24
+193.169.238.0/24
+85.234.70.0/24
