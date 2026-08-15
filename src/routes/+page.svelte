@@ -114,7 +114,7 @@
     license = s;
   }
 
-  const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "Trade", "LFG", "Faction", "Unknown"];
+  const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "Trade", "LFG", "Recruitment", "Faction", "Unknown"];
 
   /** @param {string} channel */
   function toggleChannelFilter(channel) {
@@ -235,6 +235,7 @@
       Global: "#ffb74d",
       Trade: "#fff176",
       LFG: "#a1887f",
+      Recruitment: "#4db6ac",
       Faction: "#e57373",
       Unknown: "var(--text-muted)",
     };
