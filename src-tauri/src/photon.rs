@@ -348,7 +348,16 @@ impl PhotonDecoder {
         match event_code {
             73 => self.decode_chat_message(&params), // ChatMessage
             74 => self.decode_chat_say(&params),     // ChatSay
-            75 => self.decode_chat_whisper(&params), // ChatWhisper
+            75 => {
+                // Dump raw params for whisper reverse engineering — the
+                // companion's param 0=sender, 1=message may not match live.
+                let raw = serde_json::to_string(&params_to_value(
+                    params.iter().map(|(k, v)| (*k, v.clone())).collect(),
+                ))
+                .unwrap_or_else(|_| "<unserializable>".to_string());
+                info!("ChatWhisper raw params: {}", raw);
+                self.decode_chat_whisper(&params)
+            }
             206 => {
                 self.handle_new_chat_channels(&params); // NewChatChannels
                 None
@@ -532,12 +541,21 @@ impl PhotonDecoder {
     }
 
     fn decode_chat_whisper(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
-        // ChatWhisper event structure:
-        // param 0: player_name (string)
-        // param 1: message (string)
-
-        let player_name = params.get(&0)?.as_str()?.to_string();
-        let message = params.get(&1)?.as_str()?.to_string();
+        // ChatWhisper event structure — try multiple param layouts:
+        // Layout A (companion): param 0 = sender, param 1 = message
+        // Layout B (like ChatMessage): param 0 = channel_id, 1 = sender, 2 = message
+        let (player_name, message) = if let (Some(name), Some(msg)) =
+            (params.get(&0).and_then(|v| v.as_str()), params.get(&1).and_then(|v| v.as_str()))
+        {
+            (name.to_string(), msg.to_string())
+        } else if let (Some(name), Some(msg)) =
+            (params.get(&1).and_then(|v| v.as_str()), params.get(&2).and_then(|v| v.as_str()))
+        {
+            (name.to_string(), msg.to_string())
+        } else {
+            debug!("ChatWhisper undecoded params: {:?}", params);
+            return None;
+        };
 
         let now = chrono::Local::now();
 

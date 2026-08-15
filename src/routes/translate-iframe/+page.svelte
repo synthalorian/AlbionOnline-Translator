@@ -40,6 +40,50 @@
     return () => window.removeEventListener("message", handleTheme);
   });
 
+  // ── Searchable language picker ──
+  let langOpen = $state(false);
+  let langQuery = $state("");
+  /** @type {HTMLInputElement | null} */
+  let langSearchInput = $state(null);
+
+  const filteredLanguages = $derived(
+    languages.filter((l) => {
+      const q = langQuery.trim().toLowerCase();
+      if (!q) return true;
+      return (
+        l.name.toLowerCase().includes(q) || l.code.toLowerCase().includes(q)
+      );
+    })
+  );
+
+  function currentLangName() {
+    return (
+      languages.find((l) => l.code === targetLang)?.name ?? targetLang
+    );
+  }
+
+  function openLangPicker() {
+    langQuery = "";
+    langOpen = true;
+    requestAnimationFrame(() => langSearchInput?.focus());
+  }
+
+  /** @param {string} code */
+  function selectLang(code) {
+    targetLang = code;
+    langOpen = false;
+    changeLang();
+  }
+
+  /** @param {KeyboardEvent} e */
+  function onLangKeydown(e) {
+    if (e.key === "Escape") {
+      langOpen = false;
+    } else if (e.key === "Enter" && filteredLanguages.length > 0) {
+      selectLang(filteredLanguages[0].code);
+    }
+  }
+
   function changeLang() {
     // Keep the shared settings store in sync so the picker survives reloads
     saveSettings({ ...loadSettings(), targetLanguage: targetLang });
@@ -101,11 +145,38 @@
 <div class="iframe-root">
   <div class="iframe-header">
     <span class="iframe-title">User Translator</span>
-    <select class="iframe-lang" bind:value={targetLang} onchange={changeLang}>
-      {#each languages as lang}
-        <option value={lang.code}>{lang.name}</option>
-      {/each}
-    </select>
+    <div class="lang-picker-wrapper">
+      <button
+        class="iframe-lang"
+        onclick={() => (langOpen ? (langOpen = false) : openLangPicker())}
+      >
+        {currentLangName()} ▾
+      </button>
+      {#if langOpen}
+        <div class="lang-dropdown">
+          <input
+            class="lang-search"
+            placeholder="Search languages…"
+            bind:this={langSearchInput}
+            bind:value={langQuery}
+            onkeydown={onLangKeydown}
+          />
+          <div class="lang-list">
+            {#if filteredLanguages.length === 0}
+              <div class="lang-empty">No matches</div>
+            {/if}
+            {#each filteredLanguages as lang (lang.code)}
+              <button
+                class="lang-option {lang.code === targetLang ? 'active' : ''}"
+                onclick={() => selectLang(lang.code)}
+              >
+                {lang.name}
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
   </div>
 
   <div class="iframe-input-row">
@@ -184,6 +255,67 @@
   }
   .iframe-lang:focus {
     border-color: var(--border-glow);
+  }
+
+  .lang-picker-wrapper {
+    position: relative;
+  }
+  .lang-dropdown {
+    position: absolute;
+    top: 100%;
+    right: 0;
+    margin-top: 4px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    z-index: 100;
+    width: 220px;
+    max-height: 260px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .lang-search {
+    padding: 6px 10px;
+    border: none;
+    border-bottom: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 12px;
+    outline: none;
+  }
+  .lang-search::placeholder {
+    color: var(--text-muted);
+  }
+  .lang-list {
+    overflow-y: auto;
+    flex: 1;
+  }
+  .lang-option {
+    display: block;
+    width: 100%;
+    padding: 5px 10px;
+    border: none;
+    background: none;
+    color: var(--text-primary);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .lang-option:hover {
+    background: var(--bg-tertiary);
+  }
+  .lang-option.active {
+    color: var(--accent-primary);
+    font-weight: 600;
+  }
+  .lang-empty {
+    padding: 8px 10px;
+    color: var(--text-muted);
+    font-size: 11px;
+    text-align: center;
   }
   .iframe-input-row {
     display: flex;
