@@ -66,7 +66,9 @@ impl ChatChannel {
             3 => ChatChannel::LFG,         // verified: joined runtime 19
             5 => ChatChannel::Global,      // verified: joined runtime 21
             7 => ChatChannel::Faction,     // inferred (runtime 22, unverified)
-            8 => ChatChannel::Trade,       // verified: joined runtime 2
+            // Live-verified 2026-08-15: type enum 8 joins runtime id 2, which
+            // carries English language chat, NOT Trade. Companion was wrong.
+            8 => ChatChannel::Language,
             24 => ChatChannel::Guild,      // high dynamic runtime id
             25 => ChatChannel::Alliance,   // high dynamic runtime id
             26 => ChatChannel::Party,      // inferred by 24/25 sequence
@@ -351,31 +353,48 @@ impl PhotonDecoder {
     fn handle_new_chat_channels(&mut self, params: &HashMap<u8, serde_json::Value>) {
         // NewChatChannels (206) — the channel ROSTER. Fires at login with every
         // channel you belong to, and again on zone change for the zone-local
-        // Say channel. Wire format (captured live 2026-08-15):
-        //   param 0: little-endian hex string of the channel-TYPE enum
-        //            ("1b000000" = 0x1b = 27 = Say)
-        //   param 1: array of RUNTIME channel ids of that type
+        // Say channel. Dump raw params at info level so we can diagnose the
+        // wire format from logs.
+        let raw = serde_json::to_string(&params_to_value(
+            params.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        ))
+        .unwrap_or_else(|_| "<unserializable>".to_string());
+        info!("NewChatChannels raw: {}", raw);
+
+        // Param 0 = channel-TYPE enum. Seen as a little-endian hex string
+        // ("1b000000" = 27 = Say) but may also arrive as a plain integer.
         let type_enum = params
             .get(&0)
-            .and_then(|v| v.as_str())
-            .and_then(|hex| {
-                let bytes: Vec<u8> = (0..hex.len())
-                    .step_by(2)
-                    .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
-                    .collect();
-                match bytes.len() {
-                    4 => Some(i64::from(u32::from_le_bytes(bytes.try_into().ok()?))),
-                    _ => None,
+            .and_then(|v| {
+                // Try hex string first
+                if let Some(hex) = v.as_str() {
+                    let bytes: Vec<u8> = (0..hex.len())
+                        .step_by(2)
+                        .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                        .collect();
+                    return match bytes.len() {
+                        4 => Some(i64::from(u32::from_le_bytes(bytes.try_into().ok()?))),
+                        1 => Some(i64::from(bytes[0])),
+                        _ => None,
+                    };
                 }
+                // Try plain integer
+                json_value_to_i64(v)
             });
+        // Param 1 = array of runtime channel ids. May also be a single id.
         let runtime_ids: Vec<i64> = params
             .get(&1)
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(json_value_to_i64).collect())
+            .map(|v| {
+                if let Some(arr) = v.as_array() {
+                    arr.iter().filter_map(json_value_to_i64).collect()
+                } else {
+                    json_value_to_i64(v).into_iter().collect()
+                }
+            })
             .unwrap_or_default();
 
         let (Some(type_enum), false) = (type_enum, runtime_ids.is_empty()) else {
-            debug!("NewChatChannels undecoded: {:?}", params);
+            info!("NewChatChannels undecoded: {:?}", params);
             return;
         };
         let channel = ChatChannel::from_type_enum(type_enum);
@@ -392,7 +411,7 @@ impl PhotonDecoder {
         // JoinedChatChannel (207), semantics verified against live captures via
         // AlbionOnline-Companion's ChatChannelTracker (2026-08-11):
         //   param 0 = channel-TYPE enum (2=Recruitment, 3=LFG, 5=Global,
-        //             8=Trade, 24=Guild, 25=Alliance, 26=Party, 27=Say)
+        //             8=Language(English), 24=Guild, 25=Alliance, 26=Party, 27=Say)
         //   param 1 = RUNTIME channel id — the key ChatMessage events use
         //   param 2 = channel name string ("LFG", "Faction - Caerleon", ...)
         let type_enum = value_i64(params, 0);
@@ -520,7 +539,9 @@ impl PhotonDecoder {
         match channel_id {
             0 => ChatChannel::Say,
             1 => ChatChannel::Global,
-            2 => ChatChannel::Trade,
+            // Live-verified 2026-08-15: id 2 carries the English language
+            // channel. Drop it — language channels don't need translation.
+            2 => ChatChannel::Language,
             18 => ChatChannel::Recruitment,
             19 => ChatChannel::LFG,
             21 => ChatChannel::Global,
@@ -1286,18 +1307,16 @@ mod tests {
     }
 
     #[test]
-    fn static_id_2_is_trade() {
-        // Channel id 2 = Trade (companion-verified: typeEnum 8 joins runtime 2).
+    fn static_id_2_is_language_dropped() {
+        // Channel id 2 = English language channel (live-verified 2026-08-15).
+        // Language channels are dropped at decode time.
         // Zigzag-encoded: 2 → 0x04.
         let msg_params = [
             0x03, 0x00, 0x0A, 0x04, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
             b'H', b'e', b'l', b'l', b'o',
         ];
         let mut decoder = PhotonDecoder::new();
-        let msg = decoder
-            .decode(&build_chat_packet(73, &msg_params))
-            .expect("chat message on id 2");
-        assert_eq!(msg.channel, ChatChannel::Trade);
+        assert!(decoder.decode(&build_chat_packet(73, &msg_params)).is_none());
     }
 
     #[test]

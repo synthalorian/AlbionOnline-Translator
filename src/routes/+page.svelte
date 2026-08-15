@@ -25,6 +25,20 @@
   let license = $state(null);
   /** @type {HTMLIFrameElement | null} */
   let userIframe = $state(null);
+  /** @type {HTMLDivElement | null} */
+  let chatContainer = $state(null);
+
+  // Auto-scroll chat to bottom when new messages arrive
+  $effect(() => {
+    // Depend on messages.length so this fires on every new message
+    void messages.length;
+    if (chatContainer) {
+      // Use requestAnimationFrame to wait for DOM update
+      requestAnimationFrame(() => {
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+      });
+    }
+  });
 
   // ── Iframe postMessage bridge: handle translate requests from translate-iframe ──
   /** @param {MessageEvent} event */
@@ -444,7 +458,7 @@
   ></iframe>
 
   <!-- Chat messages -->
-  <div class="chat-container" style="font-size: {settings.fontSize}px">
+  <div class="chat-container" bind:this={chatContainer} style="font-size: {settings.fontSize}px">
     {#if visibleMessages(messages).length === 0}
       <div class="empty-state">
         <p>{messages.length === 0 ? "No messages yet" : "All messages filtered out"}</p>
