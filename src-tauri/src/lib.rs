@@ -4,6 +4,7 @@ pub mod photon;
 pub mod translator;
 pub mod state;
 pub mod license;
+pub mod hosts;
 
 use license::LicenseStatus;
 use state::AppState;
