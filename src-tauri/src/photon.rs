@@ -348,16 +348,7 @@ impl PhotonDecoder {
         match event_code {
             73 => self.decode_chat_message(&params), // ChatMessage
             74 => self.decode_chat_say(&params),     // ChatSay
-            75 => {
-                // Dump raw params for whisper reverse engineering — the
-                // companion's param 0=sender, 1=message may not match live.
-                let raw = serde_json::to_string(&params_to_value(
-                    params.iter().map(|(k, v)| (*k, v.clone())).collect(),
-                ))
-                .unwrap_or_else(|_| "<unserializable>".to_string());
-                info!("ChatWhisper raw params: {}", raw);
-                self.decode_chat_whisper(&params)
-            }
+            75 => self.decode_chat_whisper(&params), // ChatWhisper
             206 => {
                 self.handle_new_chat_channels(&params); // NewChatChannels
                 None
@@ -541,21 +532,13 @@ impl PhotonDecoder {
     }
 
     fn decode_chat_whisper(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
-        // ChatWhisper event structure — try multiple param layouts:
-        // Layout A (companion): param 0 = sender, param 1 = message
-        // Layout B (like ChatMessage): param 0 = channel_id, 1 = sender, 2 = message
-        let (player_name, message) = if let (Some(name), Some(msg)) =
-            (params.get(&0).and_then(|v| v.as_str()), params.get(&1).and_then(|v| v.as_str()))
-        {
-            (name.to_string(), msg.to_string())
-        } else if let (Some(name), Some(msg)) =
-            (params.get(&1).and_then(|v| v.as_str()), params.get(&2).and_then(|v| v.as_str()))
-        {
-            (name.to_string(), msg.to_string())
-        } else {
-            debug!("ChatWhisper undecoded params: {:?}", params);
-            return None;
-        };
+        // ChatWhisper event structure (live-verified 2026-08-15):
+        //   param 0: sender name (string)
+        //   param 2: message (string)
+        //   param 3: 0 (unknown flag)
+        //   param 252: 75 (event code, always present)
+        let player_name = params.get(&0)?.as_str()?.to_string();
+        let message = params.get(&2)?.as_str()?.to_string();
 
         let now = chrono::Local::now();
 
@@ -1214,6 +1197,24 @@ mod tests {
         assert_eq!(msg.sender, "Albi");
         assert_eq!(msg.text, "Hi there!");
         assert_eq!(msg.channel, ChatChannel::Say);
+    }
+
+    #[test]
+    fn decodes_chat_whisper_event() {
+        // ChatWhisper (75): param 0 = sender, param 2 = message
+        // (live-verified 2026-08-15: {"0":"sender","2":"msg","3":0,"252":75})
+        let params = [
+            0x03, // param table size
+            0x00, 0x07, 0x04, b'A', b'l', b'b', b'i', // key 0, string "Albi"
+            0x02, 0x07, 0x05, b'H', b'e', b'l', b'l', b'o', // key 2, string "Hello"
+            0x03, 0x0B, 0x00, // key 3, u8, value 0
+        ];
+        let mut decoder = PhotonDecoder::new();
+        let msg = decoder.decode(&build_chat_packet(75, &params)).expect("chat whisper");
+
+        assert_eq!(msg.sender, "Albi");
+        assert_eq!(msg.text, "Hello");
+        assert_eq!(msg.channel, ChatChannel::Whisper);
     }
 
     #[test]
