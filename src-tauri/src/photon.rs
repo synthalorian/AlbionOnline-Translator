@@ -422,6 +422,10 @@ impl PhotonDecoder {
                 map.insert(*id, channel);
             }
         }
+        // Persist roster mappings so they survive app restarts
+        if let Ok(map) = self.channel_map.lock() {
+            crate::sniffer::save_channel_map(&map);
+        }
     }
 
     fn handle_joined_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
@@ -448,6 +452,7 @@ impl PhotonDecoder {
         );
         if let Ok(mut map) = self.channel_map.lock() {
             map.insert(runtime_id, channel);
+            crate::sniffer::save_channel_map(&map);
         }
     }
 
