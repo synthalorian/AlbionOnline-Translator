@@ -121,16 +121,28 @@ impl PacketSniffer {
         let (raw_tx, mut raw_rx) = mpsc::channel::<photon::ChatMessage>(64);
 
         tokio::spawn(async move {
+            debug!("translation worker: spawned");
             let mut translator = TranslationEngine::new();
+            debug!("translation worker: engine ready, entering recv loop");
             while let Some(msg) = raw_rx.recv().await {
+                debug!("translation worker: received msg from {}", msg.sender);
                 let ui_msg = Self::convert_message(&msg, &mut translator).await;
                 if tx.send(ui_msg).await.is_err() {
                     break;
                 }
             }
+            debug!("translation worker: recv loop exited");
         });
 
-        tokio::spawn(async move {
+        // CRITICAL: this loop MUST live on the blocking thread pool, not in a
+        // tokio::spawn task. pcap's next_packet() blocks the thread
+        // synchronously, so the capture task's poll() never returns Pending —
+        // it pins a runtime worker forever. The mpsc receiver woken by send()
+        // lands in that pinned worker's local queue and is never polled:
+        // translation silently starves while decoding logs look healthy.
+        // spawn_blocking + blocking_send is the correct shape for a
+        // synchronous capture source.
+        tokio::task::spawn_blocking(move || {
             info!("Packet capture started");
 
             let mut decoder = PhotonDecoder::new();
@@ -160,10 +172,9 @@ impl PacketSniffer {
                             }
 
                             if let Some(msg) = decoder.decode(payload) {
-                                // Bounded channel = backpressure: if the translator
-                                // is busy, drop further processing instead of
-                                // queueing unbounded work.
-                                if raw_tx.send(msg).await.is_err() {
+                                // blocking_send waits for capacity — natural
+                                // backpressure straight to the capture loop.
+                                if raw_tx.blocking_send(msg).is_err() {
                                     error!("Failed to send chat message");
                                     break;
                                 }
@@ -201,6 +212,12 @@ impl PacketSniffer {
 
     async fn convert_message(msg: &photon::ChatMessage, translator: &mut TranslationEngine) -> photon::ChatMessage {
         let source_lang = translator.detect_language(&msg.text);
+        debug!(
+            "convert_message: sender={} detect={:?} text_len={}",
+            msg.sender,
+            source_lang,
+            msg.text.len()
+        );
 
         // Only skip when we're confident it's already the target language.
         // When lingua can't decide (guild spam full of tags/symbols), still
