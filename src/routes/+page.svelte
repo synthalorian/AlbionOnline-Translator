@@ -165,6 +165,15 @@
     return list.filter((m) => settings.channelFilters[m.channel] !== false);
   }
 
+  // Collect unique unknown channel ids for the setup banner
+  const unknownChannels = $derived(
+    [...new Set(
+      messages
+        .filter((m) => m.channel === "Unknown")
+        .map((m) => m.channel_id)
+    )]
+  );
+
   async function toggleCapture() {
     try {
       if (isCapturing) {
@@ -203,6 +212,13 @@
     } catch (e) {
       console.error("Channel tag failed:", e);
     }
+  }
+
+  /** Dismiss an unknown channel from the setup banner (hide its messages) */
+  /** @param {number} channelId */
+  function dismissUnknown(channelId) {
+    // Remove messages from this unknown channel so the banner clears
+    messages = messages.filter((m) => m.channel_id !== channelId);
   }
 
   // ── Searchable language picker ──
@@ -464,6 +480,31 @@
       {/if}
     </div>
   </div>
+
+  <!-- Channel setup banner — shown when unknown channels are detected -->
+  {#if unknownChannels.length > 0}
+    <div class="setup-banner">
+      <div class="setup-title">⚠️ Unknown channels detected — click to identify:</div>
+      <div class="setup-channels">
+        {#each unknownChannels as chId}
+          <div class="setup-channel-row">
+            <span class="setup-channel-id">Channel {chId}</span>
+            {#each ["Party", "Guild", "Alliance"] as ch}
+              <button
+                class="setup-btn"
+                onclick={() => tagChannel(chId, ch)}
+              >{ch}</button>
+            {/each}
+            <button
+              class="setup-btn dismiss"
+              onclick={() => dismissUnknown(chId)}
+            >Skip</button>
+          </div>
+        {/each}
+      </div>
+      <div class="setup-hint">Tip: send a message in each channel in-game, then click the matching label here. Saved for this game session.</div>
+    </div>
+  {/if}
 
   <!-- Channel filter bar -->
   <div class="filter-bar">
@@ -924,6 +965,71 @@
     font-size: 12px;
     color: var(--text-muted);
     text-align: center;
+  }
+
+  .setup-banner {
+    padding: 8px 12px;
+    background: rgba(255, 170, 0, 0.1);
+    border-bottom: 1px solid rgba(255, 170, 0, 0.3);
+  }
+
+  .setup-title {
+    font-size: 12px;
+    font-weight: 600;
+    color: #ffaa00;
+    margin-bottom: 6px;
+  }
+
+  .setup-channels {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .setup-channel-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .setup-channel-id {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: monospace;
+    min-width: 100px;
+  }
+
+  .setup-btn {
+    padding: 3px 10px;
+    border: 1px solid var(--accent-primary);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--accent-primary);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .setup-btn:hover {
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+  }
+
+  .setup-btn.dismiss {
+    border-color: var(--text-muted);
+    color: var(--text-muted);
+  }
+
+  .setup-btn.dismiss:hover {
+    background: var(--text-muted);
+    color: var(--bg-primary);
+  }
+
+  .setup-hint {
+    font-size: 10px;
+    color: var(--text-muted);
+    margin-top: 6px;
   }
 
   .filter-bar {
