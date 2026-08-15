@@ -27,6 +27,7 @@ pub enum ChatChannel {
     LFG,
     Recruitment,
     Faction,
+    English,
     Unknown,
 }
 
@@ -43,6 +44,7 @@ impl std::fmt::Display for ChatChannel {
             ChatChannel::LFG => write!(f, "LFG"),
             ChatChannel::Recruitment => write!(f, "Recruitment"),
             ChatChannel::Faction => write!(f, "Faction"),
+            ChatChannel::English => write!(f, "English"),
             ChatChannel::Unknown => write!(f, "Unknown"),
         }
     }
@@ -250,8 +252,11 @@ impl PhotonDecoder {
         }
         let params = self.deserialize_parameter_table(&mut Reader::new(&data[1..]))?;
         let op_code = value_i64(&params, 253)?;
-        // 188 = RegisterChatPeer, 189 = SendChatMessage, 194 = Say (operation_codes.rs)
-        if matches!(op_code, 188 | 189 | 194) {
+        // 188=RegisterChatPeer, 189=SendChatMessage, 190=SendModeratorMessage,
+        // 191=JoinChatChannel, 192=LeaveChatChannel, 193=SendWhisperMessage,
+        // 194=Say (operation_codes.rs). Dumping all of them to learn which op
+        // fires on the in-game channel button and what reveals channel types.
+        if (188..=194).contains(&op_code) {
             let raw = serde_json::to_string(&params_to_value(
                 params.iter().map(|(k, v)| (*k, v.clone())).collect(),
             ))
@@ -310,15 +315,43 @@ impl PhotonDecoder {
     }
 
     fn handle_new_chat_channels(&mut self, params: &HashMap<u8, serde_json::Value>) {
-        // NewChatChannels (206) fires once at login with the initial channel
-        // roster. No reference implementation decodes its payload, so until the
-        // structure is confirmed from live captures we dump the raw params for
-        // reverse engineering instead of guessing at a mapping.
-        let raw = serde_json::to_string(&params_to_value(
-            params.iter().map(|(k, v)| (*k, v.clone())).collect(),
-        ))
-        .unwrap_or_else(|_| "<unserializable>".to_string());
-        info!("NewChatChannels raw params: {}", raw);
+        // NewChatChannels (206) — the channel ROSTER. Fires at login with every
+        // channel you belong to, and again on zone change for the zone-local
+        // Say channel. Wire format (captured live 2026-08-15):
+        //   param 0: little-endian hex string of the channel-TYPE enum
+        //            ("1b000000" = 0x1b = 27 = Say)
+        //   param 1: array of RUNTIME channel ids of that type
+        let type_enum = params
+            .get(&0)
+            .and_then(|v| v.as_str())
+            .and_then(|hex| {
+                let bytes: Vec<u8> = (0..hex.len())
+                    .step_by(2)
+                    .filter_map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                    .collect();
+                match bytes.len() {
+                    4 => Some(i64::from(u32::from_le_bytes(bytes.try_into().ok()?))),
+                    _ => None,
+                }
+            });
+        let runtime_ids: Vec<i64> = params
+            .get(&1)
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(json_value_to_i64).collect())
+            .unwrap_or_default();
+
+        let (Some(type_enum), false) = (type_enum, runtime_ids.is_empty()) else {
+            debug!("NewChatChannels undecoded: {:?}", params);
+            return;
+        };
+        let channel = ChatChannel::from_type_enum(type_enum);
+        for id in &runtime_ids {
+            info!(
+                "Chat channel roster: runtime={} type_enum={} -> {}",
+                id, type_enum, channel
+            );
+            self.channel_map.insert(*id, channel);
+        }
     }
 
     fn handle_joined_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
@@ -435,7 +468,10 @@ impl PhotonDecoder {
         match channel_id {
             0 => ChatChannel::Say,
             1 => ChatChannel::Global,
-            2 => ChatChannel::Trade,
+            // Verified live 2026-08-15: id 2 carries the English language
+            // channel (banter/help), NOT Trade. The earlier mapping came from
+            // the companion's best guess and was wrong.
+            2 => ChatChannel::English,
             18 => ChatChannel::Recruitment,
             19 => ChatChannel::LFG,
             21 => ChatChannel::Global,

@@ -21,6 +21,7 @@ const defaultSettings = {
     Guild: true,
     Alliance: true,
     Global: true,
+    English: true,
     Trade: true,
     LFG: true,
     Recruitment: true,

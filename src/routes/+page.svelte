@@ -114,7 +114,7 @@
     license = s;
   }
 
-  const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "Trade", "LFG", "Recruitment", "Faction", "Unknown"];
+  const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "English", "Trade", "LFG", "Recruitment", "Faction", "Unknown"];
 
   /** @param {string} channel */
   function toggleChannelFilter(channel) {
@@ -233,6 +233,7 @@
       Guild: "var(--status-online)",
       Alliance: "#ba68c8",
       Global: "#ffb74d",
+      English: "#ffd54f",
       Trade: "#fff176",
       LFG: "#a1887f",
       Recruitment: "#4db6ac",
