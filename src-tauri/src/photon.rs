@@ -27,7 +27,10 @@ pub enum ChatChannel {
     LFG,
     Recruitment,
     Faction,
-    English,
+    /// Language-specific channels (English, Español, Português, etc.) —
+    /// dropped at decode time, never sent to the frontend.
+    #[serde(skip)]
+    Language,
     Unknown,
 }
 
@@ -44,7 +47,7 @@ impl std::fmt::Display for ChatChannel {
             ChatChannel::LFG => write!(f, "LFG"),
             ChatChannel::Recruitment => write!(f, "Recruitment"),
             ChatChannel::Faction => write!(f, "Faction"),
-            ChatChannel::English => write!(f, "English"),
+            ChatChannel::Language => write!(f, "Language"),
             ChatChannel::Unknown => write!(f, "Unknown"),
         }
     }
@@ -93,7 +96,38 @@ impl ChatChannel {
             ChatChannel::Alliance
         } else if n.contains("party") || n.contains("group") {
             ChatChannel::Party
-        } else if n.contains("global") || n.contains("english") || n.contains("international") {
+        // Language channels — detected by name, dropped at decode time.
+        // Covers the major Albion language communities.
+        } else if n.contains("english")
+            || n.contains("español")
+            || n.contains("espanol")
+            || n.contains("spanish")
+            || n.contains("português")
+            || n.contains("portugues")
+            || n.contains("portuguese")
+            || n.contains("français")
+            || n.contains("francais")
+            || n.contains("french")
+            || n.contains("deutsch")
+            || n.contains("german")
+            || n.contains("русский")
+            || n.contains("russian")
+            || n.contains("polski")
+            || n.contains("polish")
+            || n.contains("türkçe")
+            || n.contains("turkish")
+            || n.contains("italiano")
+            || n.contains("italian")
+            || n.contains("日本語")
+            || n.contains("japanese")
+            || n.contains("한국어")
+            || n.contains("korean")
+            || n.contains("中文")
+            || n.contains("chinese")
+            || n.contains("international")
+        {
+            ChatChannel::Language
+        } else if n.contains("global") {
             ChatChannel::Global
         } else if n.contains("say") || n.contains("local") {
             ChatChannel::Say
@@ -400,6 +434,24 @@ impl PhotonDecoder {
         let message = params.get(&2)?.as_str()?.to_string();
 
         let channel = self.map_channel(channel_id);
+        // Language channels (English, Español, etc.) are dropped — they don't
+        // need translation and just add noise.
+        if channel == ChatChannel::Language {
+            trace!(
+                "ChatMessage dropped (language channel): channel_id={} sender={}",
+                channel_id, player_name
+            );
+            return None;
+        }
+        // Log unknown high-id channels — likely guild/party/alliance with
+        // dynamic runtime ids we haven't mapped yet (missed 206 roster).
+        if channel == ChatChannel::Unknown && channel_id > 100 {
+            info!(
+                "ChatMessage on unmapped high-id channel {}: sender={} text={:?} — \
+                 likely guild/party/alliance (relog after starting capture to map)",
+                channel_id, player_name, message
+            );
+        }
         debug!(
             "ChatMessage: channel_id={} channel={} sender={} text={:?}",
             channel_id, channel, player_name, message
@@ -468,10 +520,7 @@ impl PhotonDecoder {
         match channel_id {
             0 => ChatChannel::Say,
             1 => ChatChannel::Global,
-            // Verified live 2026-08-15: id 2 carries the English language
-            // channel (banter/help), NOT Trade. The earlier mapping came from
-            // the companion's best guess and was wrong.
-            2 => ChatChannel::English,
+            2 => ChatChannel::Trade,
             18 => ChatChannel::Recruitment,
             19 => ChatChannel::LFG,
             21 => ChatChannel::Global,
@@ -1234,5 +1283,58 @@ mod tests {
         let decoded = decoder.decode(&pkt(second, first.len())).expect("fragmented chat");
         assert_eq!(decoded.sender, "Albi");
         assert_eq!(decoded.text, "Hello");
+    }
+
+    #[test]
+    fn static_id_2_is_trade() {
+        // Channel id 2 = Trade (companion-verified: typeEnum 8 joins runtime 2).
+        // Zigzag-encoded: 2 → 0x04.
+        let msg_params = [
+            0x03, 0x00, 0x0A, 0x04, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
+            b'H', b'e', b'l', b'l', b'o',
+        ];
+        let mut decoder = PhotonDecoder::new();
+        let msg = decoder
+            .decode(&build_chat_packet(73, &msg_params))
+            .expect("chat message on id 2");
+        assert_eq!(msg.channel, ChatChannel::Trade);
+    }
+
+    #[test]
+    fn language_channel_dropped_via_join_name() {
+        // A JoinedChatChannel with an unmapped type enum but a language name
+        // ("English") resolves to Language. Messages on that channel are dropped.
+        // Zigzag: runtime id 42 → 0x54.
+        let join_params = [
+            0x03, // param table size
+            0x00, 0x0B, 30, // key 0, type u8, type enum 30 (unmapped)
+            0x01, 0x0A, 0x54, // key 1, compressed i64, runtime id 42
+            0x02, 0x07, 0x07, b'E', b'n', b'g', b'l', b'i', b's', b'h', // key 2, string "English"
+        ];
+        let mut decoder = PhotonDecoder::new();
+        decoder.decode(&build_chat_packet(207, &join_params));
+
+        let msg_params = [
+            0x03, 0x00, 0x0A, 0x54, 0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', 0x02, 0x07, 0x05,
+            b'H', b'e', b'l', b'l', b'o',
+        ];
+        // Language channel messages are dropped — decode returns None.
+        assert!(decoder.decode(&build_chat_packet(73, &msg_params)).is_none());
+    }
+
+    #[test]
+    fn language_channel_names_detected() {
+        // Various language channel names should resolve to Language.
+        assert_eq!(ChatChannel::from_channel_name("English"), ChatChannel::Language);
+        assert_eq!(ChatChannel::from_channel_name("Español"), ChatChannel::Language);
+        assert_eq!(ChatChannel::from_channel_name("Português"), ChatChannel::Language);
+        assert_eq!(ChatChannel::from_channel_name("Français"), ChatChannel::Language);
+        assert_eq!(ChatChannel::from_channel_name("Deutsch"), ChatChannel::Language);
+        assert_eq!(ChatChannel::from_channel_name("Русский"), ChatChannel::Language);
+        assert_eq!(ChatChannel::from_channel_name("International"), ChatChannel::Language);
+        // Non-language channels still resolve correctly.
+        assert_eq!(ChatChannel::from_channel_name("Trade"), ChatChannel::Trade);
+        assert_eq!(ChatChannel::from_channel_name("LFG"), ChatChannel::LFG);
+        assert_eq!(ChatChannel::from_channel_name("Global"), ChatChannel::Global);
     }
 }
