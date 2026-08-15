@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tracing::{debug, trace};
+use tracing::{debug, info, trace};
 
 /// Photon Unity Networking protocol decoder for Albion Online
 /// Ported from albion-network-lib Protocol18 (commit f373e56)
@@ -228,6 +228,10 @@ impl PhotonDecoder {
             73 => self.decode_chat_message(&params), // ChatMessage
             74 => self.decode_chat_say(&params),     // ChatSay
             75 => self.decode_chat_whisper(&params), // ChatWhisper
+            206 => {
+                self.handle_new_chat_channels(&params); // NewChatChannels
+                None
+            }
             207 => {
                 self.handle_joined_chat_channel(&params); // JoinedChatChannel
                 None
@@ -240,6 +244,18 @@ impl PhotonDecoder {
         }
     }
 
+    fn handle_new_chat_channels(&mut self, params: &HashMap<u8, serde_json::Value>) {
+        // NewChatChannels (206) fires once at login with the initial channel
+        // roster. No reference implementation decodes its payload, so until the
+        // structure is confirmed from live captures we dump the raw params for
+        // reverse engineering instead of guessing at a mapping.
+        let raw = serde_json::to_string(&params_to_value(
+            params.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        ))
+        .unwrap_or_else(|_| "<unserializable>".to_string());
+        info!("NewChatChannels raw params: {}", raw);
+    }
+
     fn handle_joined_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
         // JoinedChatChannel (207): param 0 = chat_index (u8), param 1 = channel_id (i64)
         let chat_index = value_i64(params, 0);
@@ -249,7 +265,7 @@ impl PhotonDecoder {
             return;
         };
         let channel = ChatChannel::from_chat_index(chat_index);
-        debug!(
+        info!(
             "Chat channel joined: id={} index={} -> {}",
             channel_id, chat_index, channel
         );
@@ -262,7 +278,7 @@ impl PhotonDecoder {
             debug!("LeftChatChannel with missing params: {:?}", params);
             return;
         };
-        debug!("Chat channel left: id={}", channel_id);
+        info!("Chat channel left: id={}", channel_id);
         self.channel_map.remove(&channel_id);
     }
 
@@ -712,7 +728,7 @@ fn to_signed_short(value: i64) -> i32 {
 /// map session-assigned channel_ids to their chat channel (from the AOSnifferNET
 /// / albion-network-lib EventCode tables).
 fn is_relevant_event(code: i32) -> bool {
-    matches!(code, 73 | 74 | 75 | 207 | 208) // ChatMessage | ChatSay | ChatWhisper | JoinedChatChannel | LeftChatChannel
+    matches!(code, 73 | 74 | 75 | 206 | 207 | 208) // ChatMessage | ChatSay | ChatWhisper | NewChatChannels | JoinedChatChannel | LeftChatChannel
 }
 
 fn params_to_value(params: HashMap<u8, serde_json::Value>) -> serde_json::Value {

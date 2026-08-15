@@ -210,6 +210,13 @@ impl TranslationEngine {
         // Try free Google Translate (no API key required) — same backend as translate.google.com
         match self.translate_google_free(trimmed, target_lang).await {
             Ok(translated) => {
+                info!(
+                    "Translated {}->{}: {:?} -> {:?}",
+                    detected.as_deref().unwrap_or("auto"),
+                    target_lang,
+                    trimmed,
+                    translated
+                );
                 self.cache.insert(cache_key, translated.clone());
                 return Some(translated);
             }
@@ -277,6 +284,13 @@ impl TranslationEngine {
         // Try free Google Translate (no API key required) — same backend as translate.google.com
         match self.translate_google_free(trimmed, &self.target_language).await {
             Ok(translated) => {
+                info!(
+                    "Translated {}->{}: {:?} -> {:?}",
+                    detected.as_deref().unwrap_or("auto"),
+                    self.target_language,
+                    trimmed,
+                    translated
+                );
                 self.cache.insert(cache_key, translated.clone());
                 return Some(translated);
             }

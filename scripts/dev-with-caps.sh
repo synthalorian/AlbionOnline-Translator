@@ -53,8 +53,13 @@ trap 'kill $WATCHER_PID 2>/dev/null || true' EXIT
 # Run the dev server, but pre-warm vite's transform cache before the app
 # window opens. On cold start vite can serve a .svelte style module as raw
 # source (starts with `<script>`), which postcss chokes on as "Unknown word
-# onMount" — a red overlay in the webview on every first boot. Curling the
-# style module forces the svelte plugin to transform it, closing the race.
+# onMount" — a red overlay in the webview on every first boot.
+#
+# The style sub-module (?svelte&type=style) can only be served once the PARENT
+# SFC has been transformed, because vite-plugin-svelte caches the extracted
+# <style> block keyed by the parent module. Curling the style URL alone 500s
+# forever — which is why the old warm loop never succeeded. Warm the parents
+# first, then the style modules.
 #
 # The `--runner` flag replaces cargo with run-with-caps.sh, which builds,
 # applies setcap caps synchronously, THEN spawns the binary — closing the
@@ -62,9 +67,16 @@ trap 'kill $WATCHER_PID 2>/dev/null || true' EXIT
 RUNNER="$(cd "$(dirname "$0")" && pwd)/run-with-caps.sh"
 npm run tauri dev -- --runner "$RUNNER" &
 NPM_PID=$!
-for _ in $(seq 1 60); do
-  if curl -fsS -o /dev/null \
-      "http://localhost:1420/src/routes/translate-iframe/+page.svelte?svelte&type=style&lang.css" 2>/dev/null; then
+
+warm_url() {
+  curl -fsS -o /dev/null "http://localhost:1420/$1" 2>/dev/null
+}
+
+for _ in $(seq 1 120); do
+  if warm_url "src/routes/translate-iframe/+page.svelte" \
+     && warm_url "src/routes/+page.svelte" \
+     && warm_url "src/routes/translate-iframe/+page.svelte?svelte&type=style&lang.css" \
+     && warm_url "src/routes/+page.svelte?svelte&type=style&lang.css"; then
     echo "[dev-with-caps] vite transform cache warmed"
     break
   fi
