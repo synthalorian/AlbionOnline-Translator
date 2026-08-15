@@ -285,11 +285,35 @@ impl PhotonDecoder {
 
         match msg_type {
             MESSAGE_OPERATION_REQUEST => self.decode_operation_request(payload),
-            MESSAGE_OPERATION_RESPONSE => None, // server->client, not needed for chat display
+            MESSAGE_OPERATION_RESPONSE => {
+                // Server->client op responses. RegisterChatPeer response may
+                // contain the channel roster — dump for reverse engineering.
+                self.decode_operation_response(payload);
+                None
+            }
             MESSAGE_EVENT => self.decode_event(payload),
             MESSAGE_ENCRYPTED => None,
             _ => None,
         }
+    }
+
+    /// Server->client operation responses. Dump all of them — the
+    /// RegisterChatPeer response may contain the channel roster (type enums
+    /// + runtime ids) which would let us map guild/party/alliance without
+    /// needing the 206 login roster.
+    fn decode_operation_response(&mut self, data: &[u8]) {
+        if data.len() < 2 {
+            return;
+        }
+        let Some(params) = self.deserialize_parameter_table(&mut Reader::new(&data[1..])) else {
+            return;
+        };
+        let op_code = value_i64(&params, 253);
+        let raw = serde_json::to_string(&params_to_value(
+            params.iter().map(|(k, v)| (*k, v.clone())).collect(),
+        ))
+        .unwrap_or_else(|_| "<unserializable>".to_string());
+        info!("Op response {:?}: {}", op_code, raw);
     }
 
     /// Outbound (client->server) operations. SendChatMessage (189) is how the
