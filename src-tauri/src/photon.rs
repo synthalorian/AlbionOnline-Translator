@@ -163,8 +163,9 @@ const MESSAGE_ENCRYPTED: u8 = 131;
 /// Photon decoder with Protocol18 deserialization
 #[derive(Clone)]
 pub struct PhotonDecoder {
-    // Channel state tracking for chat channel mapping
-    channel_map: HashMap<i64, ChatChannel>,
+    // Channel state tracking for chat channel mapping. Shared with the
+    // sniffer so the UI can inject manual mappings for Unknown channels.
+    channel_map: std::sync::Arc<std::sync::Mutex<HashMap<i64, ChatChannel>>>,
     // Reassembles fragmented SendFragment commands
     fragments: FragmentReassembler,
 }
@@ -172,7 +173,17 @@ pub struct PhotonDecoder {
 impl PhotonDecoder {
     pub fn new() -> Self {
         Self {
-            channel_map: HashMap::new(),
+            channel_map: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fragments: FragmentReassembler::new(),
+        }
+    }
+
+    /// Create a decoder with a shared channel map (for UI-injected mappings).
+    pub fn with_channel_map(
+        map: std::sync::Arc<std::sync::Mutex<HashMap<i64, ChatChannel>>>,
+    ) -> Self {
+        Self {
+            channel_map: map,
             fragments: FragmentReassembler::new(),
         }
     }
@@ -407,7 +418,9 @@ impl PhotonDecoder {
                 "Chat channel roster: runtime={} type_enum={} -> {}",
                 id, type_enum, channel
             );
-            self.channel_map.insert(*id, channel);
+            if let Ok(mut map) = self.channel_map.lock() {
+                map.insert(*id, channel);
+            }
         }
     }
 
@@ -433,7 +446,9 @@ impl PhotonDecoder {
             "Chat channel joined: runtime={} type_enum={} name={:?} -> {}",
             runtime_id, type_enum, name, channel
         );
-        self.channel_map.insert(runtime_id, channel);
+        if let Ok(mut map) = self.channel_map.lock() {
+            map.insert(runtime_id, channel);
+        }
     }
 
     fn handle_left_chat_channel(&mut self, params: &HashMap<u8, serde_json::Value>) {
@@ -443,7 +458,9 @@ impl PhotonDecoder {
             return;
         };
         info!("Chat channel left: id={}", channel_id);
-        self.channel_map.remove(&channel_id);
+        if let Ok(mut map) = self.channel_map.lock() {
+            map.remove(&channel_id);
+        }
     }
 
     fn decode_chat_message(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
@@ -540,8 +557,10 @@ impl PhotonDecoder {
         // Unknown. Static table merges albion-network-lib's faction ids with
         // the companion's capture-verified globals (Trade=2, Recruitment=18,
         // LFG=19, Global=21 — "RECLUTA" spam on 18, "busco party" on 19).
-        if let Some(channel) = self.channel_map.get(&channel_id) {
-            return *channel;
+        if let Ok(map) = self.channel_map.lock() {
+            if let Some(channel) = map.get(&channel_id) {
+                return *channel;
+            }
         }
         match channel_id {
             0 => ChatChannel::Say,

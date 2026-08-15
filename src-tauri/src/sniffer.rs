@@ -1,11 +1,12 @@
 use pcap::{Capture, Device};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::{network::extract_udp_payload, photon::PhotonDecoder, translator::TranslationEngine, hosts::HostFilter};
-use crate::photon;
+use crate::photon::{self, ChatChannel};
 
 // Albion's game UDP ports are stable across the entire server fleet, while
 // the server IPs rotate across many ranges (5.188.125.x, 5.45.187.x,
@@ -21,6 +22,9 @@ pub struct PacketSniffer {
     running: Arc<AtomicBool>,
     tx: mpsc::Sender<photon::ChatMessage>,
     host_filter: Option<HostFilter>,
+    /// Shared channel map — the decoder reads/writes through this, and the
+    /// Tauri command handler can inject manual mappings from the UI.
+    channel_map: Arc<StdMutex<HashMap<i64, ChatChannel>>>,
 }
 
 impl PacketSniffer {
@@ -37,6 +41,7 @@ impl PacketSniffer {
             running: Arc::new(AtomicBool::new(false)),
             tx,
             host_filter,
+            channel_map: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -114,6 +119,7 @@ impl PacketSniffer {
         let running = self.running.clone();
         let tx = self.tx.clone();
         let host_filter = self.host_filter.clone();
+        let channel_map = self.channel_map.clone();
 
         // Raw decoded (untranslated) messages flow into a bounded channel;
         // a dedicated worker translates them off the capture loop so a slow
@@ -145,7 +151,7 @@ impl PacketSniffer {
         tokio::task::spawn_blocking(move || {
             info!("Packet capture started");
 
-            let mut decoder = PhotonDecoder::new();
+            let mut decoder = PhotonDecoder::with_channel_map(channel_map);
             let mut packet_number = 0usize;
             let mut filtered_count = 0usize;
             let mut ip_filtered_count = 0usize;
@@ -204,6 +210,20 @@ impl PacketSniffer {
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Inject a manual channel mapping from the UI (e.g. user tags Unknown
+    /// channel 25813 as Guild). Takes effect immediately for future messages.
+    pub fn set_channel_mapping(&self, channel_id: i64, channel: ChatChannel) {
+        if let Ok(mut map) = self.channel_map.lock() {
+            info!("Manual channel mapping: {} -> {}", channel_id, channel);
+            map.insert(channel_id, channel);
+        }
+    }
+
+    /// Get the shared channel map for the decoder.
+    pub fn shared_channel_map(&self) -> Arc<StdMutex<HashMap<i64, ChatChannel>>> {
+        self.channel_map.clone()
     }
 
     pub fn is_running(&self) -> bool {

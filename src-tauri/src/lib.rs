@@ -95,6 +95,28 @@ async fn translate_user_text(
     }
 }
 
+#[tauri::command]
+async fn set_channel_mapping(
+    channel_id: i64,
+    channel: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let ch = match channel.as_str() {
+        "Party" => photon::ChatChannel::Party,
+        "Guild" => photon::ChatChannel::Guild,
+        "Alliance" => photon::ChatChannel::Alliance,
+        "Trade" => photon::ChatChannel::Trade,
+        "Global" => photon::ChatChannel::Global,
+        "LFG" => photon::ChatChannel::LFG,
+        "Recruitment" => photon::ChatChannel::Recruitment,
+        "Faction" => photon::ChatChannel::Faction,
+        _ => return Err(format!("Unknown channel type: {}", channel)),
+    };
+    let sniffer = state.sniffer.lock().await;
+    sniffer.set_channel_mapping(channel_id, ch);
+    Ok(format!("Channel {} mapped to {}", channel_id, channel))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -137,6 +159,7 @@ pub fn run() {
             deactivate_license,
             get_buy_url,
             translate_user_text,
+            set_channel_mapping,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

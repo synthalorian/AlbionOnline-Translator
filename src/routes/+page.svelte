@@ -171,6 +171,22 @@
     }
   }
 
+  /** Tag an Unknown channel as a known type (Party/Guild/Alliance/Trade) */
+  /** @param {number} channelId @param {string} channelType */
+  async function tagChannel(channelId, channelType) {
+    try {
+      await invoke("set_channel_mapping", { channelId, channel: channelType });
+      // Retroactively update visible messages with this channel_id
+      messages = messages.map((m) =>
+        m.channel_id === channelId && m.channel === "Unknown"
+          ? { ...m, channel: channelType }
+          : m
+      );
+    } catch (e) {
+      console.error("Channel tag failed:", e);
+    }
+  }
+
   // ── Searchable language picker ──
   let langOpen = $state(false);
   let langQuery = $state("");
@@ -474,6 +490,17 @@
             <span class="channel" style="color: {getChannelColor(msg.channel)}">
               [{msg.channel === "Unknown" ? `Unknown:${msg.channel_id}` : msg.channel}]
             </span>
+            {#if msg.channel === "Unknown"}
+              <span class="channel-tagger">
+                {#each ["Party", "Guild", "Alliance", "Trade"] as ch}
+                  <button
+                    class="tag-btn"
+                    onclick={() => tagChannel(msg.channel_id, ch)}
+                    title="Tag channel {msg.channel_id} as {ch}"
+                  >{ch}</button>
+                {/each}
+              </span>
+            {/if}
             <span class="sender">{msg.sender}</span>
             {#if msg.source_lang && msg.source_lang !== settings.targetLanguage}
               <span class="lang-badge">{msg.source_lang}</span>
@@ -1008,6 +1035,29 @@
     font-size: 10px;
     text-transform: uppercase;
     color: var(--text-secondary);
+  }
+
+  .channel-tagger {
+    display: inline-flex;
+    gap: 2px;
+  }
+
+  .tag-btn {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 0 4px;
+    font-size: 9px;
+    color: var(--text-muted);
+    cursor: pointer;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    transition: color 0.15s, border-color 0.15s;
+  }
+
+  .tag-btn:hover {
+    color: var(--accent-primary);
+    border-color: var(--accent-primary);
   }
 
   .message-body {
