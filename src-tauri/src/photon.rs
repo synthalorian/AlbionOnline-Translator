@@ -168,13 +168,20 @@ pub struct PhotonDecoder {
     channel_map: std::sync::Arc<std::sync::Mutex<HashMap<i64, ChatChannel>>>,
     // Reassembles fragmented SendFragment commands
     fragments: FragmentReassembler,
+    // Dedup: track recent message hashes to drop duplicate captures
+    // (same packet seen on multiple interfaces, or server double-send)
+    recent_messages: std::collections::VecDeque<(u64, std::time::Instant)>,
 }
 
 impl PhotonDecoder {
+    const DEDUP_WINDOW_MS: u128 = 500;
+    const DEDUP_CAPACITY: usize = 64;
+
     pub fn new() -> Self {
         Self {
             channel_map: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             fragments: FragmentReassembler::new(),
+            recent_messages: std::collections::VecDeque::new(),
         }
     }
 
@@ -185,7 +192,42 @@ impl PhotonDecoder {
         Self {
             channel_map: map,
             fragments: FragmentReassembler::new(),
+            recent_messages: std::collections::VecDeque::new(),
         }
+    }
+
+    fn hash_message(channel_id: i64, sender: &str, text: &str) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        channel_id.hash(&mut h);
+        sender.hash(&mut h);
+        text.hash(&mut h);
+        h.finish()
+    }
+
+    fn is_duplicate(&mut self, channel_id: i64, sender: &str, text: &str) -> bool {
+        let hash = Self::hash_message(channel_id, sender, text);
+        let now = std::time::Instant::now();
+
+        // Prune entries older than the dedup window
+        while let Some((_, ts)) = self.recent_messages.front() {
+            if now.duration_since(*ts).as_millis() > Self::DEDUP_WINDOW_MS {
+                self.recent_messages.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.recent_messages.iter().any(|(h, _)| *h == hash) {
+            return true;
+        }
+
+        if self.recent_messages.len() >= Self::DEDUP_CAPACITY {
+            self.recent_messages.pop_front();
+        }
+        self.recent_messages.push_back((hash, now));
+        false
     }
 
     /// Decode a Photon UDP packet
@@ -492,7 +534,7 @@ impl PhotonDecoder {
         }
     }
 
-    fn decode_chat_message(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
+    fn decode_chat_message(&mut self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
         // ChatMessage event structure (Protocol18):
         // param 0: channel_id
         // param 1: player_name (string)
@@ -501,6 +543,11 @@ impl PhotonDecoder {
         let channel_id = value_i64(params, 0)?;
         let player_name = params.get(&1)?.as_str()?.to_string();
         let message = params.get(&2)?.as_str()?.to_string();
+
+        // Dedup: drop duplicate captures (same packet on multiple interfaces)
+        if self.is_duplicate(channel_id, &player_name, &message) {
+            return None;
+        }
 
         let channel = self.map_channel(channel_id);
         // Language channels (English, Español, etc.) are dropped — they don't
@@ -539,13 +586,18 @@ impl PhotonDecoder {
         })
     }
 
-    fn decode_chat_say(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
+    fn decode_chat_say(&mut self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
         // ChatSay event structure:
         // param 0: player_name (string)
         // param 1: message (string)
 
         let player_name = params.get(&0)?.as_str()?.to_string();
         let message = params.get(&1)?.as_str()?.to_string();
+
+        // Dedup: drop duplicate say captures
+        if self.is_duplicate(0, &player_name, &message) {
+            return None;
+        }
 
         let now = chrono::Local::now();
 
@@ -560,7 +612,7 @@ impl PhotonDecoder {
         })
     }
 
-    fn decode_chat_whisper(&self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
+    fn decode_chat_whisper(&mut self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
         // ChatWhisper event structure (live-verified 2026-08-15):
         //   param 0: sender name (string)
         //   param 2: message (string)
@@ -568,6 +620,11 @@ impl PhotonDecoder {
         //   param 252: 75 (event code, always present)
         let player_name = params.get(&0)?.as_str()?.to_string();
         let message = params.get(&2)?.as_str()?.to_string();
+
+        // Dedup: drop duplicate whisper captures
+        if self.is_duplicate(-1, &player_name, &message) {
+            return None;
+        }
 
         let now = chrono::Local::now();
 
