@@ -129,10 +129,16 @@ sudo setcap cap_net_raw,cap_net_admin=eip ./src-tauri/target/release/albion-tran
 - [x] User translator (outgoing chat)
 - [x] Searchable language picker (~80 languages)
 - [x] Language channel stripping
-- [ ] SQLite translation cache
-- [ ] CTranslate2 local translation models
-- [ ] Installer packaging (NSIS, AppImage, DMG)
-- [ ] Auto-update mechanism
+- [x] SQLite translation cache
+- [x] CTranslate2 local translation models
+- [x] Installer packaging (deb, rpm)
+- [x] Auto-update mechanism
+- [ ] Windows/macOS CI builds (cross-compilation)
+- [ ] GitHub release with latest.json for updater
+- [ ] Click-through overlay mode
+- [ ] Compact/mini mode
+- [ ] Chat log export
+- [ ] Custom translation glossary (game terms)
 
 ## References
 
