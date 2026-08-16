@@ -133,12 +133,12 @@ sudo setcap cap_net_raw,cap_net_admin=eip ./src-tauri/target/release/albion-tran
 - [x] CTranslate2 local translation models
 - [x] Installer packaging (deb, rpm)
 - [x] Auto-update mechanism
+- [x] GitHub release with latest.json for updater
+- [x] Click-through overlay mode
+- [x] Compact/mini mode
+- [x] Chat log export
+- [x] Custom translation glossary (game terms)
 - [ ] Windows/macOS CI builds (cross-compilation)
-- [ ] GitHub release with latest.json for updater
-- [ ] Click-through overlay mode
-- [ ] Compact/mini mode
-- [ ] Chat log export
-- [ ] Custom translation glossary (game terms)
 
 ## References
 
