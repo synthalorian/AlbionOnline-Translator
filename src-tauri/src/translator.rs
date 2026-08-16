@@ -8,6 +8,65 @@ use std::sync::Mutex as StdMutex;
 
 /// Translation engine with pluggable backends
 /// Priority: CTranslate2 (local) > Google Translate (free, no key) > fallback tag
+
+/// Albion-specific glossary — terms that Google Translate mangles.
+/// Applied as pre-translation replacement so the API sees consistent English.
+static GLOSSARY: &[(&str, &str)] = &[
+    ("HO", "hideout"),
+    ("ZvZ", "zerg versus zerg"),
+    ("Gank", "gank"),
+    ("Ganking", "ganking"),
+    ("LFG", "looking for group"),
+    ("LFM", "looking for members"),
+    ("WTS", "want to sell"),
+    ("WTB", "want to buy"),
+    ("WTT", "want to trade"),
+    ("PVE", "PvE"),
+    ("PVP", "PvP"),
+    ("AO", "Albion Online"),
+    ("BZ", "black zone"),
+    ("RZ", "red zone"),
+    ("YZ", "yellow zone"),
+    ("CTA", "call to arms"),
+    ("Zerg", "zerg"),
+    ("Ava", "Avalonian"),
+    ("Avas", "Avalonians"),
+    ("Dive", "dive"),
+    ("Diving", "diving"),
+    ("Static", "static dungeon"),
+    ("Estatica", "static dungeon"),
+    ("Roaming", "roaming"),
+    ("Gank", "gank"),
+    ("Blob", "blob"),
+    ("Clap", "clap"),
+    ("Bomb", "bomb squad"),
+    ("Bombsquad", "bomb squad"),
+    ("Rat", "rat"),
+    ("Rats", "rats"),
+    ("Fame", "fame"),
+    ("Spec", "specialization"),
+    ("Specs", "specializations"),
+    ("IP", "item power"),
+    ("MP", "masterpiece"),
+    ("T8", "tier 8"),
+    ("T7", "tier 7"),
+    ("T6", "tier 6"),
+    ("T5", "tier 5"),
+    ("T4", "tier 4"),
+    ("8.3", "8.3"),
+    ("8.4", "8.4"),
+    ("Recluta", "recruiting"),
+    ("Reclutando", "recruiting"),
+    ("Reclutamiento", "recruitment"),
+    ("Busco", "looking for"),
+    ("Procuro", "looking for"),
+    ("Grupales", "group dungeons"),
+    ("Dorados", "gold chests"),
+    ("Azules", "blue chests"),
+    ("Caminos", "roads"),
+    ("Gremio", "guild"),
+    ("Guilda", "guild"),
+];
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslationRequest {
     pub text: String,
@@ -134,7 +193,7 @@ impl TranslationEngine {
                     |row| row.get(0),
                 );
                 if let Ok(translated) = result {
-                    return Some(translated);
+                    return Some(Self::apply_glossary(&translated));
                 }
             }
         }
@@ -226,6 +285,29 @@ impl TranslationEngine {
         !self.ct2_translators.is_empty()
     }
 
+    /// Apply the Albion glossary to translated text — ensures game terms
+    /// are consistent in English output (e.g. "hiding place" → "hideout",
+    /// "looking for group" stays as "LFG").
+    fn apply_glossary(text: &str) -> String {
+        let mut result = text.to_string();
+        for (term, replacement) in GLOSSARY {
+            // Case-insensitive whole-word replacement
+            let lower = result.to_lowercase();
+            let term_lower = term.to_lowercase();
+            if let Some(pos) = lower.find(&term_lower) {
+                let before = &lower[..pos];
+                let after = &lower[pos + term_lower.len()..];
+                // Only replace if it's a whole word (not part of another word)
+                let word_before = before.chars().last().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+                let word_after = after.chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+                if word_before && word_after {
+                    result = format!("{}{}{}", &result[..pos], replacement, &result[pos + term.len()..]);
+                }
+            }
+        }
+        result
+    }
+
     /// Translate with an explicit target language (per-call, doesn't mutate engine state).
     /// Used by the user translator iframe for multi-language support.
     pub async fn translate_with_target(
@@ -271,7 +353,7 @@ impl TranslationEngine {
                     match self.translate_ct2(translator, trimmed, Some(det)).await {
                         Ok(translated) => {
                             self.cache_insert(cache_key, translated.clone());
-                            return Some(translated);
+                            return Some(Self::apply_glossary(&translated));
                         }
                         Err(e) => {
                             debug!("CTranslate2 failed: {}", e);
@@ -292,7 +374,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(translated);
+                return Some(Self::apply_glossary(&translated));
             }
             Err(e) => {
                 debug!("Google Translate (free) failed: {}", e);
@@ -348,7 +430,7 @@ impl TranslationEngine {
                 match self.translate_ct2(translator, trimmed, Some(det)).await {
                     Ok(translated) => {
                         self.cache_insert(cache_key, translated.clone());
-                        return Some(translated);
+                        return Some(Self::apply_glossary(&translated));
                     }
                     Err(e) => {
                         debug!("CTranslate2 failed: {}", e);
@@ -368,7 +450,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(translated);
+                return Some(Self::apply_glossary(&translated));
             }
             Err(e) => {
                 debug!("Google Translate (free) failed: {}", e);

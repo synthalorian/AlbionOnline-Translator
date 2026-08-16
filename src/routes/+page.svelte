@@ -23,6 +23,7 @@
   let showSettings = $state(false);
   let checkingUpdates = $state(false);
   let updateStatus = $state("");
+  let compactMode = $state(false);
   /** @type {import("$lib/license.js").LicenseStatus | null} */
   let license = $state(null);
   /** @type {HTMLIFrameElement | null} */
@@ -287,6 +288,33 @@
     }
   }
 
+  async function toggleClickThrough() {
+    try {
+      await invoke("set_click_through", { enabled: settings.clickThrough });
+      saveSettings(settings);
+    } catch (e) {
+      console.error("Click-through toggle failed:", e);
+      // Revert on failure
+      settings.clickThrough = !settings.clickThrough;
+    }
+  }
+
+  function exportChatLog() {
+    const lines = messages.map((m) => {
+      const translated = m.translated_text && m.translated_text !== m.text
+        ? ` → ${m.translated_text}`
+        : "";
+      return `[${m.timestamp}] [${m.channel}] ${m.sender}: ${m.text}${translated}`;
+    });
+    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `albion-chat-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
   /** @param {string} themeId */
   function selectTheme(themeId) {
     currentTheme = themeId;
@@ -330,6 +358,9 @@
       <span>Albion Translator</span>
     </div>
     <div class="controls">
+      <button class="btn-icon" onclick={() => compactMode = !compactMode} title={compactMode ? "Expand" : "Compact mode"}>
+        {compactMode ? "🔽" : "🔼"}
+      </button>
       <button class="btn-icon" onclick={() => { showSettings = !showSettings; showThemePicker = false; }} title="Settings">
         ⚙️
       </button>
@@ -337,6 +368,7 @@
         🎨
       </button>
       <button class="btn-icon" onclick={clearMessages} title="Clear">🗑️</button>
+      <button class="btn-icon" onclick={exportChatLog} title="Export chat log">💾</button>
       <button 
         class="btn-icon {isCapturing ? 'active' : ''}" 
         onclick={toggleCapture}
@@ -426,6 +458,13 @@
         </label>
       </div>
 
+      <div class="setting-row">
+        <label class="checkbox-label">
+          <input type="checkbox" bind:checked={settings.clickThrough} onchange={toggleClickThrough} />
+          <span>Click-Through (mouse passes to game)</span>
+        </label>
+      </div>
+
       <div class="setting-row" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
         <button class="setup-btn" style="width: 100%;" onclick={checkUpdates} disabled={checkingUpdates}>
           {checkingUpdates ? "Checking…" : updateStatus || "Check for Updates"}
@@ -503,7 +542,7 @@
   </div>
 
   <!-- Channel setup banner — shown when unknown channels are detected -->
-  {#if unknownChannels.length > 0}
+  {#if unknownChannels.length > 0 && !compactMode}
     <div class="setup-banner">
       <div class="setup-title">⚠️ Unknown channels detected — click to identify:</div>
       <div class="setup-channels">
@@ -528,6 +567,7 @@
   {/if}
 
   <!-- Channel filter bar -->
+  {#if !compactMode}
   <div class="filter-bar">
     {#each FILTER_CHANNELS as ch}
       <button
@@ -542,8 +582,10 @@
     <button class="chip util" onclick={() => setAllChannelFilters(true)} title="Show all channels">All</button>
     <button class="chip util" onclick={() => setAllChannelFilters(false)} title="Hide all channels">None</button>
   </div>
+  {/if}
 
   <!-- User translator iframe -->
+  {#if !compactMode}
   <iframe
     src="/translate-iframe"
     bind:this={userIframe}
@@ -552,6 +594,7 @@
     sandbox="allow-same-origin allow-scripts allow-forms"
     onload={pushThemeToIframe}
   ></iframe>
+  {/if}
 
   <!-- Chat messages -->
   <div class="chat-container" bind:this={chatContainer} onscroll={onChatScroll} style="font-size: {settings.fontSize}px">
@@ -606,9 +649,11 @@
   {/if}
 
   <!-- Footer -->
+  {#if !compactMode}
   <div class="footer">
     <span class="disclaimer">Passive sniffer — no game modification</span>
   </div>
+  {/if}
 </main>
 
 <style>
