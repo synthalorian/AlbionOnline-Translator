@@ -185,6 +185,21 @@ async fn check_for_updates(app: tauri::AppHandle) -> Result<String, String> {
     }
 }
 
+#[tauri::command]
+async fn set_click_through(enabled: bool, app: tauri::AppHandle) -> Result<String, String> {
+    if let Some(window) = app.get_webview_window("main") {
+        window
+            .set_ignore_cursor_events(enabled)
+            .map_err(|e| e.to_string())?;
+        Ok(format!(
+            "Click-through {}",
+            if enabled { "enabled" } else { "disabled" }
+        ))
+    } else {
+        Err("Main window not found".to_string())
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -231,6 +246,7 @@ pub fn run() {
             set_channel_mapping,
             download_translation_model,
             check_for_updates,
+            set_click_through,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
