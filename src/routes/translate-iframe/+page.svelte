@@ -6,7 +6,7 @@
 
   // Defaults come from the shared settings store (same origin, same localStorage)
   const stored = loadSettings();
-  let targetLang = $state(stored.targetLanguage || "en");
+  let targetLang = $state(stored.userTargetLanguage || "es");
   let inputText = $state("");
   let result = $state("");
   let translating = $state(false);
@@ -86,9 +86,8 @@
 
   function changeLang() {
     // Keep the shared settings store in sync so the picker survives reloads
-    saveSettings({ ...loadSettings(), targetLanguage: targetLang });
-    // Tell the parent to update its own select + the backend target language
-    window.parent.postMessage({ type: "albion-set-target-lang", lang: targetLang }, "*");
+    saveSettings({ ...loadSettings(), userTargetLanguage: targetLang });
+    // User translator language is independent — don't sync to parent
   }
 
   async function translate() {
