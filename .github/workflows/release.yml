@@ -23,7 +23,7 @@ jobs:
             rustflags: -Ctarget-feature=+crt-static
           - os: macos-latest
             target: aarch64-apple-darwin
-            args: --bundles dmg,updater
+            args: --bundles app,dmg
 
     runs-on: ${{ matrix.os }}
 
