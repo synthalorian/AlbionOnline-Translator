@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="screenshots/albiontranslatortest.png" alt="Albion Online Translator screenshot" width="720">
+</p>
+
 # Albion Online Translator
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
