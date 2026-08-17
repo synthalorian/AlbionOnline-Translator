@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Albion Online Translator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.synth.albion-translator",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -34,7 +34,7 @@
         "https://github.com/synthalorian/AlbionOnline-Translator/releases/latest/download/latest.json"
       ],
       "dialog": true,
-      "pubkey": ""
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDRFMjk1RUE2NThDMEJDNjgKUldSb3ZNQllwbDRwVG5mcTM3WkRXWktTQ0U4aHdHZWVJd1RSUmE1VWJobk9UdmZidC9Bc2tPOXIK"
     }
   },
   "bundle": {
