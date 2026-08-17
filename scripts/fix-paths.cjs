@@ -21,25 +21,33 @@ if (fixed !== html) {
   console.log('No path fixes needed');
 }
 
-// Bundle wpcap.dll (Npcap SDK) so the Windows release can sniff packets
+// Bundle Npcap DLL(s) so the Windows release can sniff packets
 // without requiring the user to install Npcap. Copy into build/ so the
-// Tauri bundler includes it in the app directory.
+// Tauri bundler includes them in the app directory.
 const buildDir = path.join(__dirname, '..', 'build');
-const dllName = 'wpcap.dll';
-const srcEnv = process.env.NPCAP_DLL_PATH;
-let src = srcEnv;
-if (!src) {
-  // CI: Npcap SDK extracted to C:\npcap-sdk by the release workflow
-  if (process.platform === 'win32') {
-    src = 'C:\\npcap-sdk\\Lib\\x64\\wpcap.dll';
+const SDK_ROOT = process.env.NPCAP_SDK_PATH || (process.platform === 'win32' ? 'C:\\npcap-sdk' : '');
+const libDir = path.join(SDK_ROOT, 'Lib', 'x64');
+
+// Npcap SDK ships either wpcap.dll or vpcap.dll depending on version.
+// Prefer the one that actually exists in the SDK Lib\x64 folder.
+function bundleDllIfPresent(name) {
+  const src = path.join(libDir, name);
+  if (fs.existsSync(src)) {
+    fs.copyFileSync(src, path.join(buildDir, name));
+    console.log(`Bundled ${name} from ${src}`);
+    return true;
   }
+  return false;
 }
-if (src && fs.existsSync(src)) {
-  fs.copyFileSync(src, path.join(buildDir, dllName));
-  console.log(`Bundled ${dllName} from ${src}`);
-} else if (process.platform === 'win32') {
+
+let bundled = false;
+if (SDK_ROOT && fs.existsSync(libDir)) {
+  bundled = bundleDllIfPresent('vpcap.dll') || bundleDllIfPresent('wpcap.dll');
+}
+
+if (!bundled && process.platform === 'win32') {
   console.warn(
-    `WARNING: ${dllName} not found — Windows builds will lack packet capture. ` +
-    `Set NPCAP_DLL_PATH or extract the Npcap SDK to C:\\npcap-sdk.`
+    'WARNING: No Npcap DLL (vpcap.dll / wpcap.dll) found — Windows builds will lack packet capture. ' +
+    'Set NPCAP_SDK_PATH or extract the Npcap SDK to C:\\npcap-sdk.'
   );
 }
