@@ -9,7 +9,16 @@ permissions:
   contents: write
 
 jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" --draft --title "Albion Online Translator ${{ github.ref_name }}" --notes "See the assets below for your platform."
+
   build:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
