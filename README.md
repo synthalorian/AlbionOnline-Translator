@@ -1,6 +1,8 @@
 # Albion Online Translator
 
-A cross-platform overlay application that translates Albion Online in-game chat in real-time. Built with Tauri v2, Svelte, and Rust.
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://www.apache.org/licenses/LICENSE-2.0)
+
+A free and open-source cross-platform overlay application that translates Albion Online in-game chat in real-time. Built with Tauri v2, Svelte, and Rust.
 
 ## Features
 
@@ -149,8 +151,16 @@ sudo setcap cap_net_raw,cap_net_admin=eip ./src-tauri/target/release/albion-tran
 
 ## License
 
-MIT
+Apache-2.0 — free and open source, forever.
 
 ## Disclaimer
 
 Not affiliated with Sandbox Interactive. Use at your own risk. While this app follows SBI's stated policy on passive monitoring, policies may change.
+
+---
+
+## ☕ Support the Developer
+
+If this project saved you time, solved a problem, or just made your day a little more neon, you can fuel the next one:
+
+[![Buy Me A Coffee](https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png)](https://buymeacoffee.com/synthalorian)

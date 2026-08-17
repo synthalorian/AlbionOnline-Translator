@@ -4,6 +4,7 @@ version = "0.1.0"
 default-run = "albion-translator"
 description = "Albion Online chat translator overlay"
 authors = ["synth"]
+license = "Apache-2.0"
 edition = "2021"
 
 [lib]

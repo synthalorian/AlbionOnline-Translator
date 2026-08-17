@@ -3,10 +3,8 @@ pub mod sniffer;
 pub mod photon;
 pub mod translator;
 pub mod state;
-pub mod license;
 pub mod hosts;
 
-use license::LicenseStatus;
 use state::AppState;
 
 use tauri::{Emitter, Manager, State};
@@ -49,36 +47,6 @@ async fn set_target_language(
 async fn get_target_language(state: State<'_, AppState>) -> Result<String, String> {
     let engine = state.translator.lock().await;
     Ok(engine.target_language().to_string())
-}
-
-// ---------------------------------------------------------------------------
-// Licensing
-// ---------------------------------------------------------------------------
-
-#[tauri::command]
-async fn get_license_status(state: State<'_, AppState>) -> Result<LicenseStatus, String> {
-    let mut mgr = state.license.lock().await;
-    Ok(mgr.status().await)
-}
-
-#[tauri::command]
-async fn activate_license(
-    key: String,
-    state: State<'_, AppState>,
-) -> Result<LicenseStatus, String> {
-    let mut mgr = state.license.lock().await;
-    mgr.activate(&key).await
-}
-
-#[tauri::command]
-async fn deactivate_license(state: State<'_, AppState>) -> Result<(), String> {
-    let mut mgr = state.license.lock().await;
-    mgr.deactivate().await
-}
-
-#[tauri::command]
-async fn get_buy_url() -> String {
-    license::BUY_URL.to_string()
 }
 
 #[tauri::command]
@@ -213,20 +181,14 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(move |app| {
             let state = AppState::new(tx);
-            let license = state.license.clone();
             app.manage(state);
 
             let app_handle = app.handle().clone();
 
-            // Spawn the chat message forwarder (license-gated)
+            // Spawn the chat message forwarder
             tauri::async_runtime::spawn(async move {
                 while let Some(msg) = rx.recv().await {
-                    let mut mgr = license.lock().await;
-                    if mgr.is_unlocked().await {
-                        let _ = app_handle.emit("chat-message", &msg);
-                    } else if mgr.take_locked_notice() {
-                        let _ = app_handle.emit("license-locked", ());
-                    }
+                    let _ = app_handle.emit("chat-message", &msg);
                 }
             });
 
@@ -238,10 +200,6 @@ pub fn run() {
             get_capture_status,
             set_target_language,
             get_target_language,
-            get_license_status,
-            activate_license,
-            deactivate_license,
-            get_buy_url,
             translate_user_text,
             set_channel_mapping,
             download_translation_model,

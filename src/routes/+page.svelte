@@ -4,9 +4,7 @@
   import { onMount, onDestroy } from "svelte";
   import { themes, themeCategories, getTheme, applyTheme, getStoredTheme } from "$lib/themes.js";
   import { loadSettings, saveSettings, applySettings } from "$lib/settings.js";
-  import { loadLicenseStatus } from "$lib/license.js";
   import { languages } from "$lib/languages.js";
-  import LicenseGate from "$lib/LicenseGate.svelte";
 
   let settings = $state(loadSettings());
   let isCapturing = $state(false);
@@ -16,16 +14,12 @@
   let messages = $state([]);
   /** @type {(() => void) | null} */
   let unlisten = null;
-  /** @type {(() => void) | null} */
-  let unlistenLocked = null;
   let currentTheme = $state(settings.theme || getStoredTheme());
   let showThemePicker = $state(false);
   let showSettings = $state(false);
   let checkingUpdates = $state(false);
   let updateStatus = $state("");
   let compactMode = $state(false);
-  /** @type {import("$lib/license.js").LicenseStatus | null} */
-  let license = $state(null);
   /** @type {HTMLIFrameElement | null} */
   let userIframe = $state(null);
   /** @type {HTMLDivElement | null} */
@@ -122,7 +116,6 @@
     try {
       isCapturing = await invoke("get_capture_status");
       settings.targetLanguage = await invoke("get_target_language");
-      license = await loadLicenseStatus();
     } catch (e) {
       console.error("Failed to load state:", e);
     }
@@ -131,23 +124,12 @@
       const msg = event.payload;
       messages = [...messages.slice(-settings.maxMessages + 1), msg];
     });
-
-    // Backend drops messages while locked; re-check status when told
-    unlistenLocked = await listen("license-locked", async () => {
-      license = await loadLicenseStatus();
-    });
   });
 
   onDestroy(() => {
     if (unlisten) unlisten();
-    if (unlistenLocked) unlistenLocked();
     window.removeEventListener("message", handleIframeMessage);
   });
-
-  /** @param {import("$lib/license.js").LicenseStatus} s */
-  function onLicenseActivated(s) {
-    license = s;
-  }
 
   const FILTER_CHANNELS = ["Say", "Whisper", "Party", "Guild", "Alliance", "Global", "Trade", "LFG", "Recruitment", "Faction", "Unknown"];
 
@@ -378,11 +360,6 @@
       </button>
     </div>
   </div>
-
-  <!-- License gate: trial banner or full paywall overlay -->
-  {#if license && license.mode !== "licensed"}
-    <LicenseGate status={license} onactivated={onLicenseActivated} />
-  {/if}
 
   <!-- Settings panel -->
   {#if showSettings}
