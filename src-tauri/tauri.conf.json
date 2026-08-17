@@ -48,7 +48,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "additionalFiles": ["vpcap.dll", "wpcap.dll"],
+    "resources": ["resources/vpcap.dll", "resources/wpcap.dll"],
     "linux": {
       "deb": {
         "depends": ["libpcap0.8", "libwebkit2gtk-4.1-0"]
