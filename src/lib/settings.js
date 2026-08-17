@@ -1,6 +1,6 @@
 // Settings management for Albion Online Translator
 
-/** @typedef {{ opacity: number, fontSize: number, maxMessages: number, showTimestamps: boolean, showOriginal: boolean, showTranslated: boolean, clickThrough: boolean, alwaysOnTop: boolean, theme: string, targetLanguage: string }} Settings */
+/** @typedef {{ opacity: number, fontSize: number, maxMessages: number, showTimestamps: boolean, showOriginal: boolean, showTranslated: boolean, clickThrough: boolean, alwaysOnTop: boolean, theme: string, targetLanguage: string, userTargetLanguage: string }} Settings */
 
 const defaultSettings = {
   opacity: 0.92,
@@ -13,6 +13,7 @@ const defaultSettings = {
   alwaysOnTop: true,
   theme: 'synthwave-84',
   targetLanguage: 'en',
+  userTargetLanguage: 'es',
   // Per-channel visibility toggles — every Albion chat channel, all on by default.
   // Language channels (English, Español, etc.) are dropped at decode time.
   channelFilters: {
