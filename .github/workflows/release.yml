@@ -22,9 +22,6 @@ jobs:
             args: --bundles nsis
             rustflags: -Ctarget-feature=+crt-static
           - os: macos-latest
-            target: x86_64-apple-darwin
-            args: --bundles dmg
-          - os: macos-latest
             target: aarch64-apple-darwin
             args: --bundles dmg
 
