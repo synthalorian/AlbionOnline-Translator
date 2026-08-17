@@ -20,6 +20,7 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             args: --bundles nsis
+            rustflags: -Ctarget-feature=+crt-static
           - os: macos-latest
             target: x86_64-apple-darwin
             args: --bundles dmg
@@ -68,10 +69,11 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          RUSTFLAGS: ${{ matrix.rustflags }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Albion Online Translator ${{ github.ref_name }}"
           releaseBody: "See the assets below for your platform."
           releaseDraft: true
           prerelease: false
-          args: ${{ matrix.args }}
+          args: --target ${{ matrix.target }} ${{ matrix.args }}
