@@ -24,6 +24,8 @@ if (fixed !== html) {
 // Bundle Npcap runtime DLL into src-tauri/resources/ so the Tauri v2
 // bundler includes it in the Windows app package. The pcap crate loads
 // wpcap.dll at runtime via LoadLibrary — it must sit next to the .exe.
+//
+// Modern Npcap (1.70+) ships only wpcap.dll — vpcap.dll is obsolete.
 const resourcesDir = path.join(__dirname, '..', 'src-tauri', 'resources');
 const SDK_ROOT = process.env.NPCAP_SDK_PATH || (process.platform === 'win32' ? 'C:\\npcap-sdk' : '');
 const libDir = path.join(SDK_ROOT, 'Lib', 'x64');
@@ -33,42 +35,26 @@ if (!fs.existsSync(resourcesDir)) {
   fs.mkdirSync(resourcesDir, { recursive: true });
 }
 
-// Npcap SDK Lib\x64 contains wpcap.lib (import library) + optionally
-// wpcap.dll (extracted from the Npcap installer by CI). Look for wpcap.dll
-// and bundle whichever one lands there. vpcap.dll was the old name;
-// modern Npcap (1.70+) uses wpcap.dll only — skip vpcap.dll.
-function bundleDllIfPresent(name) {
-  const src = path.join(libDir, name);
-  if (fs.existsSync(src) && fs.statSync(src).size > 0) {
-    fs.copyFileSync(src, path.join(resourcesDir, name));
-    console.log(`Bundled ${name} from ${src} (${(fs.statSync(src).size / 1024).toFixed(0)} KB)`);
-    return true;
-  }
-  return false;
-}
-
-let bundled = false;
-
-// Prefer wpcap.dll (modern Npcap); fall back to vpcap.dll for legacy SDKs
-bundled = bundleDllIfPresent('wpcap.dll');
-if (!bundled) {
-  bundled = bundleDllIfPresent('vpcap.dll');
-}
-
-// On non-Windows builds the DLL won't exist — remove any stale placeholder
-// from a previous run so the Tauri bundler doesn't try to package an empty file.
-const targetName = bundled ? (bundled === 'wpcap.dll' ? 'wpcap.dll' : 'vpcap.dll') : null;
+// Clean up any stale DLLs from previous runs or older configs.
+// We only ever bundle wpcap.dll; vpcap.dll is dead.
 for (const name of ['vpcap.dll', 'wpcap.dll']) {
   const resPath = path.join(resourcesDir, name);
   if (fs.existsSync(resPath)) {
-    if (name === targetName) {
-      // keep the one we just bundled
-      continue;
-    }
-    // remove placeholder or wrong DLL
     fs.unlinkSync(resPath);
     console.log(`Removed stale ${name} from resources/`);
   }
+}
+
+// Copy wpcap.dll if present and non-empty in the SDK lib directory
+const wpcapSrc = path.join(libDir, 'wpcap.dll');
+let bundled = false;
+
+if (SDK_ROOT && fs.existsSync(wpcapSrc) && fs.statSync(wpcapSrc).size > 0) {
+  const dest = path.join(resourcesDir, 'wpcap.dll');
+  fs.copyFileSync(wpcapSrc, dest);
+  const sizeKB = (fs.statSync(dest).size / 1024).toFixed(0);
+  console.log(`Bundled wpcap.dll from ${wpcapSrc} (${sizeKB} KB)`);
+  bundled = true;
 }
 
 if (!bundled && process.platform === 'win32') {
@@ -76,4 +62,6 @@ if (!bundled && process.platform === 'win32') {
     'WARNING: wpcap.dll not found in ' + libDir + ' — Windows builds will lack packet capture. ' +
     'Ensure the CI step extracts the Npcap installer DLL into C:\\npcap-sdk\\Lib\\x64.'
   );
+} else if (!bundled) {
+  console.log('Non-Windows build — no Npcap DLL needed.');
 }

@@ -61,26 +61,36 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # Download and extract Npcap SDK (for .lib import library)
+          # --- 1) Npcap SDK (import lib + headers for compile-time) ---
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "npcap-sdk.zip"
-          Expand-Archive npcap-sdk.zip -DestinationPath C:\npcap-sdk
+          Expand-Archive npcap-sdk.zip -DestinationPath C:\npcap-sdk -Force
           "LIB=C:\npcap-sdk\Lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Npcap SDK extracted to C:\npcap-sdk"
+          Get-ChildItem "C:\npcap-sdk\Lib\x64" | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
 
-          # Download Npcap installer to extract the actual runtime DLL(s)
+          # --- 2) Npcap installer (contains the actual wpcap.dll runtime) ---
+          #     The SDK zip only has .lib import libraries — no DLLs.
+          #     wpcap.dll only ships inside the NSIS installer.
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.78.exe" -OutFile "npcap-installer.exe"
-          # Extract with 7z (available on Windows runners)
-          & 7z x npcap-installer.exe -o"C:\npcap-dll" -r "*.dll" -y
-          # Copy all DLLs into the SDK Lib\x64 folder so fix-paths.cjs finds them
-          $libDir = "C:\npcap-sdk\Lib\x64"
-          Get-ChildItem "C:\npcap-dll" -Recurse -Include "*.dll" | ForEach-Object {
-            Copy-Item $_.FullName "$libDir\$($_.Name)" -Force
-            Write-Host "::notice::Extracted DLL: $($_.Name)"
+          & 7z x npcap-installer.exe -o"C:\npcap-extract" -y | Out-Null
+
+          # Find wpcap.dll anywhere in the extracted tree (prefer x64/)
+          $dll = Get-ChildItem "C:\npcap-extract" -Recurse -Filter "wpcap.dll" |
+                 Sort-Object Length -Descending |
+                 Select-Object -First 1
+
+          if (-not $dll) {
+            Write-Error "::error::wpcap.dll not found inside npcap-1.78.exe — cannot bundle packet capture"
+            exit 1
           }
-          # Show what we landed with
-          Write-Host "DLLs available in lib dir:"
-          Get-ChildItem $libDir -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+
+          $libDir = "C:\npcap-sdk\Lib\x64"
+          Copy-Item $dll.FullName "$libDir\wpcap.dll" -Force
+          $sizeKB = [math]::Round($dll.Length / 1024)
+          Write-Host "✓ Extracted wpcap.dll: $($dll.FullName) → $libDir\wpcap.dll ($sizeKB KB)"
+
           # Cleanup
-          Remove-Item "C:\npcap-dll" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\npcap-extract" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item npcap-installer.exe -ErrorAction SilentlyContinue
 
       - name: Install frontend dependencies
