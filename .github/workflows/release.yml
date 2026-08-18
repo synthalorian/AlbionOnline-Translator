@@ -57,13 +57,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libpcap-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
-      - name: Install Npcap SDK (Windows)
+      - name: Install Npcap SDK + extract runtime DLL (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # Download and extract Npcap SDK (for .lib import library)
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "npcap-sdk.zip"
           Expand-Archive npcap-sdk.zip -DestinationPath C:\npcap-sdk
           "LIB=C:\npcap-sdk\Lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+          # Download Npcap installer to extract the actual runtime DLL(s)
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.78.exe" -OutFile "npcap-installer.exe"
+          # Extract with 7z (available on Windows runners)
+          & 7z x npcap-installer.exe -o"C:\npcap-dll" -r "*.dll" -y
+          # Copy all DLLs into the SDK Lib\x64 folder so fix-paths.cjs finds them
+          $libDir = "C:\npcap-sdk\Lib\x64"
+          Get-ChildItem "C:\npcap-dll" -Recurse -Include "*.dll" | ForEach-Object {
+            Copy-Item $_.FullName "$libDir\$($_.Name)" -Force
+            Write-Host "::notice::Extracted DLL: $($_.Name)"
+          }
+          # Show what we landed with
+          Write-Host "DLLs available in lib dir:"
+          Get-ChildItem $libDir -Filter "*.dll" | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+          # Cleanup
+          Remove-Item "C:\npcap-dll" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item npcap-installer.exe -ErrorAction SilentlyContinue
 
       - name: Install frontend dependencies
         run: npm ci
