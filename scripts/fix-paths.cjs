@@ -21,9 +21,9 @@ if (fixed !== html) {
   console.log('No path fixes needed');
 }
 
-// Bundle Npcap DLL(s) into src-tauri/resources/ so the Tauri v2 bundler
-// includes them in the Windows app package. The pcap crate loads them at
-// runtime via LoadLibrary — they must sit next to the .exe.
+// Bundle Npcap runtime DLL into src-tauri/resources/ so the Tauri v2
+// bundler includes it in the Windows app package. The pcap crate loads
+// wpcap.dll at runtime via LoadLibrary — it must sit next to the .exe.
 const resourcesDir = path.join(__dirname, '..', 'src-tauri', 'resources');
 const SDK_ROOT = process.env.NPCAP_SDK_PATH || (process.platform === 'win32' ? 'C:\\npcap-sdk' : '');
 const libDir = path.join(SDK_ROOT, 'Lib', 'x64');
@@ -33,37 +33,47 @@ if (!fs.existsSync(resourcesDir)) {
   fs.mkdirSync(resourcesDir, { recursive: true });
 }
 
-// Npcap SDK ships either wpcap.dll or vpcap.dll depending on version.
-// Prefer the one that actually exists in the SDK Lib\x64 folder.
+// Npcap SDK Lib\x64 contains wpcap.lib (import library) + optionally
+// wpcap.dll (extracted from the Npcap installer by CI). Look for wpcap.dll
+// and bundle whichever one lands there. vpcap.dll was the old name;
+// modern Npcap (1.70+) uses wpcap.dll only — skip vpcap.dll.
 function bundleDllIfPresent(name) {
   const src = path.join(libDir, name);
-  if (fs.existsSync(src)) {
+  if (fs.existsSync(src) && fs.statSync(src).size > 0) {
     fs.copyFileSync(src, path.join(resourcesDir, name));
-    console.log(`Bundled ${name} from ${src}`);
+    console.log(`Bundled ${name} from ${src} (${(fs.statSync(src).size / 1024).toFixed(0)} KB)`);
     return true;
   }
   return false;
 }
 
 let bundled = false;
-if (SDK_ROOT && fs.existsSync(libDir)) {
-  bundled = bundleDllIfPresent('vpcap.dll') || bundleDllIfPresent('wpcap.dll');
+
+// Prefer wpcap.dll (modern Npcap); fall back to vpcap.dll for legacy SDKs
+bundled = bundleDllIfPresent('wpcap.dll');
+if (!bundled) {
+  bundled = bundleDllIfPresent('vpcap.dll');
 }
 
-// On non-Windows builds the DLLs won't exist — create placeholders so the
-// Tauri bundler's resource glob doesn't fail. They stay empty and are never
-// loaded at runtime (the pcap crate only calls LoadLibrary on Windows).
+// On non-Windows builds the DLL won't exist — remove any stale placeholder
+// from a previous run so the Tauri bundler doesn't try to package an empty file.
+const targetName = bundled ? (bundled === 'wpcap.dll' ? 'wpcap.dll' : 'vpcap.dll') : null;
 for (const name of ['vpcap.dll', 'wpcap.dll']) {
   const resPath = path.join(resourcesDir, name);
-  if (!fs.existsSync(resPath)) {
-    fs.writeFileSync(resPath, '');
-    console.log(`Placeholder ${name} (no Npcap SDK — will be skipped on non-Windows)`);
+  if (fs.existsSync(resPath)) {
+    if (name === targetName) {
+      // keep the one we just bundled
+      continue;
+    }
+    // remove placeholder or wrong DLL
+    fs.unlinkSync(resPath);
+    console.log(`Removed stale ${name} from resources/`);
   }
 }
 
 if (!bundled && process.platform === 'win32') {
   console.warn(
-    'WARNING: No Npcap DLL (vpcap.dll / wpcap.dll) found — Windows builds will lack packet capture. ' +
-    'Set NPCAP_SDK_PATH or extract the Npcap SDK to C:\\npcap-sdk.'
+    'WARNING: wpcap.dll not found in ' + libDir + ' — Windows builds will lack packet capture. ' +
+    'Ensure the CI step extracts the Npcap installer DLL into C:\\npcap-sdk\\Lib\\x64.'
   );
 }
