@@ -20,7 +20,9 @@ if [[ ! -f "$SRC" ]]; then
 fi
 
 mkdir -p "$HOME/.local/bin"
-cp "$SRC" "$DEST"
+# cp needs sudo: after the first install the binary is root-owned (required
+# for file caps), so a plain user cp can no longer overwrite it.
+sudo cp "$SRC" "$DEST"
 sudo chown root:root "$DEST"
 sudo chmod 755 "$DEST"
 sudo setcap "$CAPS" "$DEST"

@@ -6,6 +6,14 @@ use lingua::{Language, LanguageDetector, LanguageDetectorBuilder};
 use rusqlite::Connection;
 use std::sync::Mutex as StdMutex;
 
+/// Above this lingua confidence, text is assumed to already be the target
+/// language and translation is skipped. Below it, text goes to Google sl=auto.
+const SKIP_TARGET_CONFIDENCE: f64 = 0.75;
+
+/// Minimum lingua confidence before trusting a detected language enough to
+/// route text through that language's local CT2 model.
+const CT2_MIN_CONFIDENCE: f64 = 0.5;
+
 /// Translation engine with pluggable backends
 /// Priority: CTranslate2 (local) > Google Translate (free, no key) > fallback tag
 
@@ -116,7 +124,10 @@ impl TranslationEngine {
     pub fn new() -> Self {
         let google_api_key = std::env::var("GOOGLE_TRANSLATE_API_KEY").ok();
 
-        // Build lingua detector with common Albion languages
+        // Build lingua detector with common Albion languages.
+        // NOTE: this list only gates the LOCAL fast paths (skip-if-target and
+        // CT2 model pick). Anything uncertain falls through to Google sl=auto,
+        // which detects 100+ languages server-side.
         let languages = vec![
             Language::English,
             Language::Spanish,
@@ -130,10 +141,18 @@ impl TranslationEngine {
             Language::Turkish,
             Language::Arabic,
             Language::Thai,
+            Language::Polish,
+            Language::Ukrainian,
+            Language::Italian,
+            Language::Vietnamese,
+            Language::Indonesian,
         ];
 
         let detector = LanguageDetectorBuilder::from_languages(&languages)
-            .with_minimum_relative_distance(0.25)
+            // 0.25 was too strict for slangy game chat ("Busco players con
+            // experiencia en el gankeo" came back unknown). 0.1 catches
+            // mixed game-speak; lingua still returns None on true noise.
+            .with_minimum_relative_distance(0.1)
             .build();
 
         // Look for CTranslate2 models
@@ -327,11 +346,9 @@ impl TranslationEngine {
         let detected = source_lang.map(|s| s.to_string())
             .or_else(|| self.detect_language(trimmed));
 
-        // Skip if already in target language
-        if let Some(ref det) = detected {
-            if det == target_lang {
-                return None;
-            }
+        // Confidence-gated skip — see translate() for rationale.
+        if self.language_confidence(trimmed, target_lang) >= SKIP_TARGET_CONFIDENCE {
+            return None;
         }
 
         let cache_key = format!(
@@ -347,16 +364,19 @@ impl TranslationEngine {
         }
 
         // Try CTranslate2 if we have a model for the detected source language
+        // (confidence-gated — wrong-model garbage gets cached otherwise).
         if target_lang == "en" {
             if let Some(ref det) = detected {
-                if let Some(translator) = self.ct2_translators.get(det.as_str()) {
-                    match self.translate_ct2(translator, trimmed, Some(det)).await {
-                        Ok(translated) => {
-                            self.cache_insert(cache_key, translated.clone());
-                            return Some(Self::apply_glossary(&translated));
-                        }
-                        Err(e) => {
-                            debug!("CTranslate2 failed: {}", e);
+                if self.language_confidence(trimmed, det) >= CT2_MIN_CONFIDENCE {
+                    if let Some(translator) = self.ct2_translators.get(det.as_str()) {
+                        match self.translate_ct2(translator, trimmed, Some(det)).await {
+                            Ok(translated) => {
+                                self.cache_insert(cache_key, translated.clone());
+                                return Some(Self::apply_glossary(&translated));
+                            }
+                            Err(e) => {
+                                debug!("CTranslate2 failed: {}", e);
+                            }
                         }
                     }
                 }
@@ -381,10 +401,12 @@ impl TranslationEngine {
             }
         }
 
-        // Fallback: return original with language tag
+        // Fallback: return original with language tag.
+        // NEVER cache this — caching an untranslated fallback poisons the
+        // cache permanently (burned 2026-08-22: Google 429s got cached and
+        // kept serving untranslated text after service recovered).
         let lang_tag = detected.unwrap_or_else(|| "unknown".to_string());
         let fallback = format!("[{}] {}", lang_tag, trimmed);
-        self.cache_insert(cache_key, fallback.clone());
         Some(fallback)
     }
 
@@ -405,11 +427,16 @@ impl TranslationEngine {
         let detected = source_lang.map(|s| s.to_string())
             .or_else(|| self.detect_language(trimmed));
 
-        // Skip if already in target language
-        if let Some(ref det) = detected {
-            if det == &self.target_language {
-                return None;
-            }
+        // Skip ONLY when lingua is CONFIDENT the text is already the target
+        // language. Best-guess equality is not enough: with relative distance
+        // 0.1 lingua always picks something, and short/slangy/unsupported chat
+        // (Polish, Ukrainian, mixed game-speak) was getting misclassified as
+        // English and silently dropped. Uncertain text goes to Google sl=auto,
+        // which detects 100+ languages server-side; Google returns identity for
+        // true target-language text and that gets cached, so repeat English
+        // spam costs nothing after the first sighting.
+        if self.language_confidence(trimmed, &self.target_language.clone()) >= SKIP_TARGET_CONFIDENCE {
+            return None;
         }
 
         let cache_key = format!(
@@ -424,16 +451,20 @@ impl TranslationEngine {
             return Some(cached.clone());
         }
 
-        // Try CTranslate2 if we have a model for the detected source language
+        // Try CTranslate2 if we have a model for the detected source language —
+        // but only when detection is reasonably sure. Ramming e.g. Polish
+        // through the German model produces garbage that then gets CACHED.
         if let Some(ref det) = detected {
-            if let Some(translator) = self.ct2_translators.get(det.as_str()) {
-                match self.translate_ct2(translator, trimmed, Some(det)).await {
-                    Ok(translated) => {
-                        self.cache_insert(cache_key, translated.clone());
-                        return Some(Self::apply_glossary(&translated));
-                    }
-                    Err(e) => {
-                        debug!("CTranslate2 failed: {}", e);
+            if self.language_confidence(trimmed, det) >= CT2_MIN_CONFIDENCE {
+                if let Some(translator) = self.ct2_translators.get(det.as_str()) {
+                    match self.translate_ct2(translator, trimmed, Some(det)).await {
+                        Ok(translated) => {
+                            self.cache_insert(cache_key, translated.clone());
+                            return Some(Self::apply_glossary(&translated));
+                        }
+                        Err(e) => {
+                            debug!("CTranslate2 failed: {}", e);
+                        }
                     }
                 }
             }
@@ -457,10 +488,12 @@ impl TranslationEngine {
             }
         }
 
-        // Fallback: return original with language tag
+        // Fallback: return original with language tag.
+        // NEVER cache this — caching an untranslated fallback poisons the
+        // cache permanently (burned 2026-08-22: Google 429s got cached and
+        // kept serving untranslated text after service recovered).
         let lang_tag = detected.unwrap_or_else(|| "unknown".to_string());
         let fallback = format!("[{}] {}", lang_tag, trimmed);
-        self.cache_insert(cache_key, fallback.clone());
         Some(fallback)
     }
 
@@ -541,15 +574,10 @@ impl TranslationEngine {
         Ok(translated)
     }
 
-    /// Detect language using lingua-rs
-    pub fn detect_language(&self, text: &str) -> Option<String> {
-        if text.is_empty() || text.len() < 3 {
-            return None;
-        }
-
-        let detected = self.detector.detect_language_of(text)?;
-
-        let code = match detected {
+    /// Map a lingua Language to our ISO-ish code. Shared by detect_language
+    /// and language_confidence so the two never drift apart.
+    fn language_to_code(lang: Language) -> &'static str {
+        match lang {
             Language::English => "en",
             Language::Spanish => "es",
             Language::Portuguese => "pt",
@@ -562,9 +590,86 @@ impl TranslationEngine {
             Language::Turkish => "tr",
             Language::Arabic => "ar",
             Language::Thai => "th",
+            Language::Polish => "pl",
+            Language::Ukrainian => "uk",
+            Language::Italian => "it",
+            Language::Vietnamese => "vi",
+            Language::Indonesian => "id",
             _ => "unknown",
-        };
+        }
+    }
 
-        Some(code.to_string())
+    /// lingua's confidence (0.0–1.0) that `text` is the given language code.
+    /// lingua reports only its top 5 candidates; anything outside that set
+    /// is treated as 0.0 — which correctly routes it to Google sl=auto.
+    fn language_confidence(&self, text: &str, lang_code: &str) -> f64 {
+        if text.is_empty() {
+            return 0.0;
+        }
+        self.detector
+            .compute_language_confidence_values(text)
+            .iter()
+            .find(|(lang, _)| Self::language_to_code(*lang) == lang_code)
+            .map(|(_, conf)| *conf)
+            .unwrap_or(0.0)
+    }
+
+    /// Detect language using lingua-rs (best guess — use language_confidence
+    /// for gating decisions; this is for display tags and cache keys only)
+    pub fn detect_language(&self, text: &str) -> Option<String> {
+        if text.is_empty() || text.len() < 3 {
+            return None;
+        }
+
+        let detected = self.detector.detect_language_of(text)?;
+        Some(Self::language_to_code(detected).to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clear_english_is_confidently_target() {
+        let engine = TranslationEngine::new();
+        let conf = engine.language_confidence("anyone up for a yellow zone fame farm run tonight", "en");
+        assert!(conf >= SKIP_TARGET_CONFIDENCE, "clear English scored {}", conf);
+    }
+
+    #[test]
+    fn spanish_is_not_skipped_as_english() {
+        let engine = TranslationEngine::new();
+        let conf = engine.language_confidence("busco grupo para gankear en la zona negra", "en");
+        assert!(conf < SKIP_TARGET_CONFIDENCE, "Spanish scored EN {}", conf);
+        // es/pt confusion is a known lingua quirk — the display tag may say
+        // either, but Google's sl=auto resolves it correctly server-side.
+        let det = engine.detect_language("busco grupo para gankear en la zona negra");
+        assert!(matches!(det.as_deref(), Some("es") | Some("pt")), "got {:?}", det);
+    }
+
+    #[test]
+    fn polish_is_detected_not_force_english() {
+        let engine = TranslationEngine::new();
+        let text = "szukam grupy na zółtą strefę, ktoś chętny";
+        let conf = engine.language_confidence(text, "en");
+        assert!(conf < SKIP_TARGET_CONFIDENCE, "Polish scored EN {}", conf);
+        assert_eq!(engine.detect_language(text).as_deref(), Some("pl"));
+    }
+
+    #[test]
+    fn slangy_mixed_chat_is_not_confidently_english() {
+        let engine = TranslationEngine::new();
+        // The class of message that used to be silently dropped.
+        let conf = engine.language_confidence("vamos bz t8 lfg", "en");
+        assert!(conf < SKIP_TARGET_CONFIDENCE, "slang scored EN {}", conf);
+    }
+
+    #[test]
+    fn unsupported_language_falls_through_to_google() {
+        let engine = TranslationEngine::new();
+        // Romanian is NOT in the detector list — must not be confidently EN.
+        let conf = engine.language_confidence("caut grup pentru bătăli de facțiuni diseară", "en");
+        assert!(conf < SKIP_TARGET_CONFIDENCE, "Romanian scored EN {}", conf);
     }
 }
