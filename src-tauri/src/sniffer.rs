@@ -299,20 +299,11 @@ impl PacketSniffer {
             msg.text.len()
         );
 
-        // Only skip when we're confident it's already the target language.
-        // When lingua can't decide (guild spam full of tags/symbols), still
-        // translate — Google's sl=auto detects on its side and handles the
-        // noisy texts lingua gives up on.
-        let should_translate = source_lang
-            .as_deref()
-            .map(|src| src != translator.target_language())
-            .unwrap_or(true);
-
-        let translated_text = if should_translate {
-            translator.translate(&msg.text, source_lang.as_deref()).await
-        } else {
-            None
-        };
+        // translate() self-gates: it returns None only when lingua is
+        // CONFIDENT the text is already the target language. Uncertain,
+        // mixed, or unsupported-language chat goes to Google sl=auto, so
+        // nothing gets silently dropped here anymore.
+        let translated_text = translator.translate(&msg.text, source_lang.as_deref()).await;
 
         photon::ChatMessage {
             timestamp: msg.timestamp.clone(),

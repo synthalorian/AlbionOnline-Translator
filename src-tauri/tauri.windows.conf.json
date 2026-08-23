@@ -1,0 +1,8 @@
+{
+  "bundle": {
+    "resources": [
+      "resources/vpcap.dll",
+      "resources/wpcap.dll"
+    ]
+  }
+}
