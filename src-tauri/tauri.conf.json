@@ -51,9 +51,6 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "resources": [
-      {"path": "resources/wpcap.dll", "target": "windows"}
-    ],
     "linux": {
       "deb": {
         "depends": [
