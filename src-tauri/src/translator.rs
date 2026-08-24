@@ -14,8 +14,48 @@ const SKIP_TARGET_CONFIDENCE: f64 = 0.75;
 /// route text through that language's local CT2 model.
 const CT2_MIN_CONFIDENCE: f64 = 0.5;
 
+/// Minimal HTML entity decoder for the /m scrape (no new deps).
+/// Handles named entities and numeric char refs (&#39; / &#x27;).
+fn html_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        // Entities are at most ~10 chars; a ';' farther out isn't ours.
+        let semi = rest.find(';').filter(|&i| i <= 12);
+        if let Some(semi) = semi {
+            let entity = &rest[1..semi];
+            let decoded = match entity {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                "nbsp" => Some(' '),
+                _ if entity.starts_with("#x") || entity.starts_with("#X") => {
+                    u32::from_str_radix(&entity[2..], 16).ok().and_then(char::from_u32)
+                }
+                _ if entity.starts_with('#') => {
+                    entity[1..].parse::<u32>().ok().and_then(char::from_u32)
+                }
+                _ => None,
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                rest = &rest[semi + 1..];
+                continue;
+            }
+        }
+        out.push('&');
+        rest = &rest[1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Translation engine with pluggable backends
-/// Priority: CTranslate2 (local) > Google Translate (free, no key) > fallback tag
+/// Priority: CTranslate2 (local) > Google gtx > Google /m (both free, no key) > fallback tag
 
 /// Albion-specific glossary — terms that Google Translate mangles.
 /// Applied as pre-translation replacement so the API sees consistent English.
@@ -401,6 +441,25 @@ impl TranslationEngine {
             }
         }
 
+        // gtx rate-limits (429) under sustained chat load; the mobile web
+        // endpoint has a separate bucket and is the next free tier.
+        match self.translate_google_mobile(trimmed, target_lang).await {
+            Ok(translated) => {
+                info!(
+                    "Translated via /m {}->{}: {:?} -> {:?}",
+                    detected.as_deref().unwrap_or("auto"),
+                    target_lang,
+                    trimmed,
+                    translated
+                );
+                self.cache_insert(cache_key, translated.clone());
+                return Some(Self::apply_glossary(&translated));
+            }
+            Err(e) => {
+                debug!("Google Translate (/m) failed: {}", e);
+            }
+        }
+
         // Fallback: return original with language tag.
         // NEVER cache this — caching an untranslated fallback poisons the
         // cache permanently (burned 2026-08-22: Google 429s got cached and
@@ -488,6 +547,25 @@ impl TranslationEngine {
             }
         }
 
+        // gtx rate-limits (429) under sustained chat load; the mobile web
+        // endpoint has a separate bucket and is the next free tier.
+        match self.translate_google_mobile(trimmed, &self.target_language).await {
+            Ok(translated) => {
+                info!(
+                    "Translated via /m {}->{}: {:?} -> {:?}",
+                    detected.as_deref().unwrap_or("auto"),
+                    self.target_language,
+                    trimmed,
+                    translated
+                );
+                self.cache_insert(cache_key, translated.clone());
+                return Some(Self::apply_glossary(&translated));
+            }
+            Err(e) => {
+                debug!("Google Translate (/m) failed: {}", e);
+            }
+        }
+
         // Fallback: return original with language tag.
         // NEVER cache this — caching an untranslated fallback poisons the
         // cache permanently (burned 2026-08-22: Google 429s got cached and
@@ -571,6 +649,51 @@ impl TranslationEngine {
             return Ok(text.to_owned());
         }
 
+        Ok(translated)
+    }
+
+    /// Google Translate MOBILE web endpoint — also no API key, same Google
+    /// engine, but a SEPARATE rate-limit bucket from the gtx JSON endpoint.
+    /// gtx 429s under sustained game-chat load (IP-level abuse detection,
+    /// burned 2026-08-22 + 2026-08-24) while /m stays up. HTML scrape:
+    /// the translation lives in <div class="result-container">...</div>.
+    async fn translate_google_mobile(
+        &self,
+        text: &str,
+        target_lang: &str,
+    ) -> anyhow::Result<String> {
+        let encoded = urlencoding::encode(text);
+        let url = format!(
+            "https://translate.google.com/m?sl=auto&tl={}&q={}",
+            target_lang,
+            encoded
+        );
+
+        let response = self
+            .http_client
+            .get(&url)
+            // /m serves a desktop variant (different markup) without a mobile UA
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 10)")
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            return Err(anyhow::anyhow!("Google /m returned {}", status));
+        }
+
+        let html = response.text().await?;
+        const MARKER: &str = "result-container\">";
+        let start = html
+            .find(MARKER)
+            .map(|i| i + MARKER.len())
+            .ok_or_else(|| anyhow::anyhow!("no result-container in /m response"))?;
+        let rest = &html[start..];
+        let end = rest.find("</div>").unwrap_or(rest.len());
+        let translated = html_unescape(rest[..end].trim());
+        if translated.is_empty() {
+            return Err(anyhow::anyhow!("empty /m result"));
+        }
         Ok(translated)
     }
 
