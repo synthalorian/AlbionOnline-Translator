@@ -683,7 +683,13 @@ impl TranslationEngine {
         }
 
         let html = response.text().await?;
-        const MARKER: &str = "result-container\">";
+        // Google serves error pages ("af-error-page", Error 500/429) with
+        // HTTP 200 — naive scraping then captures error-page HTML as the
+        // "translation" and CACHES it (burned 2026-08-24: "Q ptos" row).
+        if html.contains("af-error-page") {
+            return Err(anyhow::anyhow!("Google /m served an error page"));
+        }
+        const MARKER: &str = "class=\"result-container\">";
         let start = html
             .find(MARKER)
             .map(|i| i + MARKER.len())
@@ -691,8 +697,10 @@ impl TranslationEngine {
         let rest = &html[start..];
         let end = rest.find("</div>").unwrap_or(rest.len());
         let translated = html_unescape(rest[..end].trim());
-        if translated.is_empty() {
-            return Err(anyhow::anyhow!("empty /m result"));
+        // A real translation never contains raw HTML — Google entity-encodes
+        // source '<'/'>' characters. Residual markup means we scraped chrome.
+        if translated.is_empty() || translated.contains('<') || translated.contains('>') {
+            return Err(anyhow::anyhow!("/m result looks like markup, not a translation"));
         }
         Ok(translated)
     }
