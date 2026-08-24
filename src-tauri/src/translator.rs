@@ -10,9 +10,29 @@ use std::sync::Mutex as StdMutex;
 /// language and translation is skipped. Below it, text goes to Google sl=auto.
 const SKIP_TARGET_CONFIDENCE: f64 = 0.75;
 
-/// Minimum lingua confidence before trusting a detected language enough to
-/// route text through that language's local CT2 model.
-const CT2_MIN_CONFIDENCE: f64 = 0.5;
+/// Minimum ABSOLUTE lingua confidence before trusting a detected language
+/// enough to route text through that language's local CT2 model...
+const CT2_MIN_CONFIDENCE: f64 = 0.25;
+/// ...AND the top candidate must beat the runner-up by this margin.
+/// Rationale (burned 2026-08-24): real recruitment spam mixes URLs, English
+/// loanwords ("PREMIUM", "Youtube", "HQ"), caps-lock, and misspellings —
+/// lingua detects es correctly but at 0.34–0.37 absolute, UNDER the old 0.5
+/// gate, so plainly-Spanish chat skipped the local es model and fell through
+/// to a 429ing Google. The margin check is what actually protects against
+/// wrong-model garbage (e.g. Polish misread as de): a confused detector
+/// splits its vote across near-tied candidates and fails the margin.
+/// 1.5 not 2.0: real recruitment spam hits es/pt margins of ~1.9.
+/// es↔pt confusion is harmless — the "pt" model is opus-mt-roa-en, a
+/// multilingual Romance→en model that handles Spanish fine.
+const CT2_MIN_MARGIN: f64 = 1.5;
+
+/// Strip Albion's chat formatting markers (U+FFFF, used to bracket styled
+/// segments like ￿SEASONPOINTS￿). U+FFFF is a Unicode noncharacter with no
+/// meaning — removing it normalizes cache keys and keeps junk out of the
+/// CT2 models and Google queries.
+fn clean_chat_text(text: &str) -> String {
+    text.chars().filter(|&c| c != '\u{ffff}').collect()
+}
 
 /// Minimal HTML entity decoder for the /m scrape (no new deps).
 /// Handles named entities and numeric char refs (&#39; / &#x27;).
@@ -375,7 +395,8 @@ impl TranslationEngine {
         source_lang: Option<&str>,
         target_lang: &str,
     ) -> Option<String> {
-        let trimmed = text.trim();
+        let cleaned = clean_chat_text(text);
+        let trimmed = cleaned.trim();
         if trimmed.len() < 2 {
             return None;
         }
@@ -404,10 +425,10 @@ impl TranslationEngine {
         }
 
         // Try CTranslate2 if we have a model for the detected source language
-        // (confidence-gated — wrong-model garbage gets cached otherwise).
+        // (margin-gated — wrong-model garbage gets cached otherwise).
         if target_lang == "en" {
             if let Some(ref det) = detected {
-                if self.language_confidence(trimmed, det) >= CT2_MIN_CONFIDENCE {
+                if self.should_use_ct2(trimmed, det) {
                     if let Some(translator) = self.ct2_translators.get(det.as_str()) {
                         match self.translate_ct2(translator, trimmed, Some(det)).await {
                             Ok(translated) => {
@@ -472,7 +493,8 @@ impl TranslationEngine {
     /// Translate text, using cache when possible (uses engine's default target language)
     pub async fn translate(&mut self, text: &str, source_lang: Option<&str>) -> Option<String> {
         // Skip translation if text is empty or too short
-        let trimmed = text.trim();
+        let cleaned = clean_chat_text(text);
+        let trimmed = cleaned.trim();
         if trimmed.len() < 2 {
             return None;
         }
@@ -511,10 +533,10 @@ impl TranslationEngine {
         }
 
         // Try CTranslate2 if we have a model for the detected source language —
-        // but only when detection is reasonably sure. Ramming e.g. Polish
-        // through the German model produces garbage that then gets CACHED.
+        // margin-gated: ramming e.g. Polish through the German model produces
+        // garbage that then gets CACHED.
         if let Some(ref det) = detected {
-            if self.language_confidence(trimmed, det) >= CT2_MIN_CONFIDENCE {
+            if self.should_use_ct2(trimmed, det) {
                 if let Some(translator) = self.ct2_translators.get(det.as_str()) {
                     match self.translate_ct2(translator, trimmed, Some(det)).await {
                         Ok(translated) => {
@@ -705,6 +727,29 @@ impl TranslationEngine {
         Ok(translated)
     }
 
+    /// Decide whether `text` should route through the local CT2 model for
+    /// `det`. Requires: det is lingua's TOP candidate, absolute confidence
+    /// >= CT2_MIN_CONFIDENCE, and a >= CT2_MIN_MARGIN× lead over the
+    /// runner-up (the margin is the real wrong-model guard — a confused
+    /// detector splits its vote across near-tied languages).
+    fn should_use_ct2(&self, text: &str, det: &str) -> bool {
+        let values = self.detector.compute_language_confidence_values(text);
+        let mut confs: Vec<(&str, f64)> = values
+            .iter()
+            .map(|(lang, conf)| (Self::language_to_code(*lang), *conf))
+            .collect();
+        confs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        match confs.as_slice() {
+            [(top_lang, top_conf), rest @ ..] => {
+                let runner_up = rest.first().map(|(_, c)| *c).unwrap_or(0.0);
+                *top_lang == det
+                    && *top_conf >= CT2_MIN_CONFIDENCE
+                    && *top_conf >= CT2_MIN_MARGIN * runner_up
+            }
+            [] => false,
+        }
+    }
+
     /// Map a lingua Language to our ISO-ish code. Shared by detect_language
     /// and language_confidence so the two never drift apart.
     fn language_to_code(lang: Language) -> &'static str {
@@ -760,6 +805,50 @@ impl TranslationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ffff_markers_do_not_tank_spanish_confidence() {
+        let engine = TranslationEngine::new();
+        let dirty = "\u{ffff}SEASONPOINTS\u{ffff} RECLUTO JUGADORES ACTIVOS \u{ffff}SEASONPOINTS\u{ffff} CONTESTAMOS RAPIDO, GREMIO HISPANO CON CONTENIDO DIARIO";
+        let clean = clean_chat_text(dirty);
+        let conf_dirty = engine.language_confidence(dirty, "es");
+        let conf_clean = engine.language_confidence(&clean, "es");
+        println!("dirty={:.3} clean={:.3} (gate={})", conf_dirty, conf_clean, CT2_MIN_CONFIDENCE);
+        assert!(conf_clean >= CT2_MIN_CONFIDENCE, "cleaned es scored {}", conf_clean);
+    }
+
+    #[test]
+    fn real_recruitment_spam_routes_to_ct2() {
+        let engine = TranslationEngine::new();
+        let a = "\u{ffff}PREMIUM\u{ffff} Thetforever \u{ffff}PREMIUM\u{ffff} Visita Thetforever.com para el discord - Ve nuestros videos en Youtube y TikTok - HQ en zona negra Thetford";
+        let b = "SIY FLAMING, INVITEN A CONETENIDOS EN STERLING PLIS :)";
+        println!("A: det={:?} conf_es={:.3} conf_en={:.3} ct2={}",
+            engine.detect_language(a),
+            engine.language_confidence(a, "es"),
+            engine.language_confidence(a, "en"),
+            engine.should_use_ct2(a, "es"));
+        println!("B: det={:?} conf_es={:.3} conf_en={:.3} ct2={}",
+            engine.detect_language(b),
+            engine.language_confidence(b, "es"),
+            engine.language_confidence(b, "en"),
+            engine.should_use_ct2(b, "es"));
+        assert!(engine.should_use_ct2(a, "es"), "spam A should route to local es model");
+        assert!(engine.should_use_ct2(b, "es"), "spam B should route to local es model");
+    }
+
+    #[test]
+    fn mixed_language_text_does_not_route_to_ct2() {
+        let engine = TranslationEngine::new();
+        // Genuinely confused detection — lingua splits its vote across
+        // near-tied candidates, so the margin gate must reject CT2 routing.
+        // (Note: "hello amigo..." style text is NOT a good example — lingua
+        // is confidently es on it. True confusion looks like short
+        // en/de-ish gibberish.)
+        let mixed = "lol xd wp gg nr hf gl";
+        let det = engine.detect_language(mixed).unwrap_or_default();
+        println!("mixed: det={} ct2={}", det, engine.should_use_ct2(mixed, &det));
+        assert!(!engine.should_use_ct2(mixed, &det), "mixed text wrongly routed to {} model", det);
+    }
 
     #[test]
     fn clear_english_is_confidently_target() {
