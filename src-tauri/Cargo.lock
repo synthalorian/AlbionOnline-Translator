@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "albion-translator"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4103,8 +4103,7 @@ checksum = "2ee67f1008b1ba2321834326597b8e186293b049a023cdef258527550b9935b4"
 [[package]]
 name = "pcap"
 version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd2eecc2ddc671ec563b5b39f846556aade68a65d1afb14d8fe6b30b0457d75"
+source = "git+https://github.com/synthalorian/pcap.git?branch=lossy-utf8#07f641b8bc35c296d6f3eb7480eed885bf258487"
 dependencies = [
  "bitflags 1.3.2",
  "errno 0.2.8",

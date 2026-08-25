@@ -1,6 +1,6 @@
 [package]
 name = "albion-translator"
-version = "0.2.3"
+version = "0.2.4"
 default-run = "albion-translator"
 description = "Albion Online chat translator overlay"
 authors = ["synth"]
@@ -34,5 +34,12 @@ ct2rs = "0.10.0"
 dirs = "6.0.0"
 ctrlc = "3.5.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# On non-English Windows, Npcap/wpcap error strings are localized in legacy
+# codepages (CP1250 etc.) and fail pcap 2.x's strict UTF-8 check, masking the
+# real error as "libpcap returned invalid UTF-8". Fork converts lossily.
+# Upstream fix candidate: rust-pcap/pcap — drop this patch once merged.
+[patch.crates-io]
+pcap = { git = "https://github.com/synthalorian/pcap.git", branch = "lossy-utf8" }
 
 

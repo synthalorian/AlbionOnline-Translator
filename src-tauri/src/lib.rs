@@ -16,7 +16,18 @@ async fn start_capture(state: State<'_, AppState>) -> Result<String, String> {
     let mut sniffer = state.sniffer.lock().await;
     match sniffer.start() {
         Ok(_) => Ok("Capture started".to_string()),
-        Err(e) => Err(format!("Failed to start capture: {}", e)),
+        Err(e) => {
+            let mut msg = format!("Failed to start capture: {}", e);
+            // The bundled wpcap.dll/Packet.dll only let the app START — actual
+            // capture needs the Npcap driver/service from the full install.
+            #[cfg(target_os = "windows")]
+            {
+                msg.push_str(
+                    "\n\nCapture on Windows requires the Npcap driver. Install it from https://npcap.com (default options), then retry.",
+                );
+            }
+            Err(msg)
+        }
     }
 }
 
