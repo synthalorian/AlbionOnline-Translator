@@ -36,8 +36,8 @@ if (!fs.existsSync(resourcesDir)) {
 }
 
 // Clean up any stale DLLs from previous runs or older configs.
-// We only ever bundle wpcap.dll; vpcap.dll is dead.
-for (const name of ['vpcap.dll', 'wpcap.dll']) {
+// We bundle wpcap.dll + Packet.dll; vpcap.dll is dead.
+for (const name of ['vpcap.dll', 'wpcap.dll', 'Packet.dll', 'packet.dll']) {
   const resPath = path.join(resourcesDir, name);
   if (fs.existsSync(resPath)) {
     fs.unlinkSync(resPath);
@@ -45,23 +45,29 @@ for (const name of ['vpcap.dll', 'wpcap.dll']) {
   }
 }
 
-// Copy wpcap.dll if present and non-empty in the SDK lib directory
-const wpcapSrc = path.join(libDir, 'wpcap.dll');
-let bundled = false;
+// Copy each required DLL if present and non-empty in the SDK lib directory.
+// wpcap.dll statically imports Packet.dll — BOTH must be bundled.
+const requiredDlls = ['wpcap.dll', 'Packet.dll'];
+const missing = [];
 
-if (SDK_ROOT && fs.existsSync(wpcapSrc) && fs.statSync(wpcapSrc).size > 0) {
-  const dest = path.join(resourcesDir, 'wpcap.dll');
-  fs.copyFileSync(wpcapSrc, dest);
-  const sizeKB = (fs.statSync(dest).size / 1024).toFixed(0);
-  console.log(`Bundled wpcap.dll from ${wpcapSrc} (${sizeKB} KB)`);
-  bundled = true;
+for (const name of requiredDlls) {
+  const src = path.join(libDir, name);
+  if (SDK_ROOT && fs.existsSync(src) && fs.statSync(src).size > 0) {
+    const dest = path.join(resourcesDir, name);
+    fs.copyFileSync(src, dest);
+    const sizeKB = (fs.statSync(dest).size / 1024).toFixed(0);
+    console.log(`Bundled ${name} from ${src} (${sizeKB} KB)`);
+  } else {
+    missing.push(name);
+  }
 }
 
-if (!bundled && process.platform === 'win32') {
+if (missing.length && process.platform === 'win32') {
   console.warn(
-    'WARNING: wpcap.dll not found in ' + libDir + ' — Windows builds will lack packet capture. ' +
-    'Ensure the CI step extracts the Npcap installer DLL into C:\\npcap-sdk\\Lib\\x64.'
+    'WARNING: missing DLLs in ' + libDir + ': ' + missing.join(', ') +
+    ' — Windows builds will lack packet capture. ' +
+    'Ensure the CI step extracts wpcap.dll AND Packet.dll from the Npcap installer into C:\\npcap-sdk\\Lib\\x64.'
   );
-} else if (!bundled) {
+} else if (missing.length) {
   console.log('Non-Windows build — no Npcap DLL needed.');
 }

@@ -74,20 +74,23 @@ jobs:
           Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.78.exe" -OutFile "npcap-installer.exe"
           & 7z x npcap-installer.exe -o"C:\npcap-extract" -y | Out-Null
 
-          # Find wpcap.dll anywhere in the extracted tree (prefer x64/)
-          $dll = Get-ChildItem "C:\npcap-extract" -Recurse -Filter "wpcap.dll" |
-                 Sort-Object Length -Descending |
-                 Select-Object -First 1
-
-          if (-not $dll) {
-            Write-Error "::error::wpcap.dll not found inside npcap-1.78.exe — cannot bundle packet capture"
-            exit 1
-          }
-
+          # Find wpcap.dll + Packet.dll anywhere in the extracted tree.
+          # Npcap's wpcap.dll STATICALLY IMPORTS packet.dll — bundling wpcap.dll
+          # alone still fails to load at launch (Windows reports "wpcap.dll not
+          # found" even though the missing piece is its dependency Packet.dll).
           $libDir = "C:\npcap-sdk\Lib\x64"
-          Copy-Item $dll.FullName "$libDir\wpcap.dll" -Force
-          $sizeKB = [math]::Round($dll.Length / 1024)
-          Write-Host "✓ Extracted wpcap.dll: $($dll.FullName) → $libDir\wpcap.dll ($sizeKB KB)"
+          foreach ($name in @("wpcap.dll", "Packet.dll")) {
+            $dll = Get-ChildItem "C:\npcap-extract" -Recurse -Filter $name |
+                   Sort-Object Length -Descending |
+                   Select-Object -First 1
+            if (-not $dll) {
+              Write-Error "::error::$name not found inside npcap-1.78.exe — cannot bundle packet capture"
+              exit 1
+            }
+            Copy-Item $dll.FullName "$libDir\$name" -Force
+            $sizeKB = [math]::Round($dll.Length / 1024)
+            Write-Host "✓ Extracted ${name}: $($dll.FullName) → $libDir\$name ($sizeKB KB)"
+          }
 
           # Cleanup
           Remove-Item "C:\npcap-extract" -Recurse -Force -ErrorAction SilentlyContinue
