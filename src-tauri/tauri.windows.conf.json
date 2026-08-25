@@ -1,7 +1,8 @@
 {
   "bundle": {
-    "resources": [
-      "resources/wpcap.dll"
-    ]
+    "resources": {
+      "resources/wpcap.dll": "./",
+      "resources/Packet.dll": "./"
+    }
   }
 }
