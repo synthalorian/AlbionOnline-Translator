@@ -1,6 +1,7 @@
 use pcap::{Capture, Device};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -70,8 +71,44 @@ pub fn load_channel_map() -> HashMap<i64, ChatChannel> {
         .collect()
 }
 
+/// The machine's primary outbound IPv4, found by "connecting" a UDP socket —
+/// no traffic is actually sent, the kernel just resolves the route and tells
+/// us which local address it would use. Cross-platform replacement for
+/// parsing `ip route` (which doesn't exist on Windows).
+fn primary_outbound_ip() -> Option<IpAddr> {
+    let sock = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    sock.connect(("8.8.8.8", 80)).ok()?;
+    sock.local_addr().ok().map(|a| a.ip())
+}
+
+/// Human-readable label for a pcap device: description (friendly on Windows,
+/// e.g. "Realtek PCIe GbE Family Controller") falling back to the raw name.
+fn device_label(dev: &Device) -> String {
+    match &dev.desc {
+        Some(d) if !d.is_empty() => format!("{} ({})", d, dev.name),
+        _ => dev.name.clone(),
+    }
+}
+
+/// List all capturable devices with their addresses — for diagnostics and a
+/// future manual picker.
+pub fn list_devices() -> Vec<String> {
+    Device::list()
+        .map(|devs| {
+            devs.iter()
+                .map(|d| {
+                    let addrs: Vec<String> =
+                        d.addresses.iter().map(|a| a.addr.to_string()).collect();
+                    format!("{} [{}]", device_label(d), addrs.join(", "))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub struct PacketSniffer {
     running: Arc<AtomicBool>,
+    packets: Arc<AtomicU64>,
     tx: mpsc::Sender<photon::ChatMessage>,
     host_filter: Option<HostFilter>,
     /// Shared channel map — the decoder reads/writes through this, and the
@@ -97,39 +134,39 @@ impl PacketSniffer {
 
         Self {
             running: Arc::new(AtomicBool::new(false)),
+            packets: Arc::new(AtomicU64::new(0)),
             tx,
             host_filter,
             channel_map: Arc::new(StdMutex::new(saved)),
         }
     }
 
-    pub fn start(&mut self) -> Result<(), SnifferError> {
+    /// Start capture. Returns a human-readable label of the device being
+    /// listened on, so the UI can show exactly where packets come from.
+    pub fn start(&mut self) -> Result<String, SnifferError> {
         if self.running.load(Ordering::SeqCst) {
             return Err(SnifferError::AlreadyRunning);
         }
 
-        // Pick the interface that owns the default route — Device::lookup()
-        // happily returns tailscale0/lo and silently captures nothing.
-        let route_dev = std::process::Command::new("ip")
-            .args(["-4", "route", "show", "default"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| {
-                s.split_whitespace()
-                    .skip_while(|&w| w != "dev")
-                    .nth(1)
-                    .map(|w| w.to_string())
-            });
+        // Pick the interface that owns the machine's primary outbound IP —
+        // Device::lookup() happily returns a VPN/loopback/virtual adapter and
+        // silently captures nothing, and Windows has no `ip route` to parse.
+        // The UDP-connect trick works identically on Linux and Windows.
+        let primary_ip = primary_outbound_ip();
+        if let Some(ip) = primary_ip {
+            info!("Primary outbound IP: {}", ip);
+        }
 
-        let device = Device::list()
-            .map_err(|e| SnifferError::DeviceLookup(e.to_string()))?
-            .into_iter()
-            .find(|d| Some(&d.name) == route_dev.as_ref())
+        let devices = Device::list().map_err(|e| SnifferError::DeviceLookup(e.to_string()))?;
+        let device = devices
+            .iter()
+            .find(|d| d.addresses.iter().any(|a| Some(a.addr) == primary_ip))
+            .cloned()
             .or_else(|| Device::lookup().ok().flatten())
             .ok_or(SnifferError::NoDevice)?;
 
-        info!("Using device: {}", device.name);
+        let label = device_label(&device);
+        info!("Using device: {}", label);
 
         if let Some(ref hf) = self.host_filter {
             info!(
@@ -174,7 +211,9 @@ impl PacketSniffer {
             .map_err(|e| SnifferError::Filter(e.to_string()))?;
 
         self.running.store(true, Ordering::SeqCst);
+        self.packets.store(0, Ordering::SeqCst);
         let running = self.running.clone();
+        let packets = self.packets.clone();
         let tx = self.tx.clone();
         let host_filter = self.host_filter.clone();
         let channel_map = self.channel_map.clone();
@@ -218,6 +257,7 @@ impl PacketSniffer {
                 match cap.next_packet() {
                     Ok(packet) => {
                         packet_number += 1;
+                        packets.store(packet_number as u64, Ordering::SeqCst);
 
                         // Extract UDP payload from raw ethernet frame. The BPF
                         // port filter already gates on Albion's ports; the
@@ -263,11 +303,16 @@ impl PacketSniffer {
             );
         });
 
-        Ok(())
+        Ok(label)
     }
 
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+    }
+
+    /// Packets captured since the current capture session started.
+    pub fn packet_count(&self) -> u64 {
+        self.packets.load(Ordering::SeqCst)
     }
 
     /// Inject a manual channel mapping from the UI (e.g. user tags Unknown
@@ -329,4 +374,34 @@ pub enum SnifferError {
     CaptureOpen(String),
     #[error("Failed to set filter: {0}")]
     Filter(String),
+}
+
+#[cfg(test)]
+mod device_selection_tests {
+    use super::*;
+
+    /// The UDP-connect trick must yield a real local IPv4, and that IP
+    /// must belong to exactly one capturable device — the selection logic
+    /// start() relies on. Device::list() works unprivileged on Linux/Windows.
+    #[test]
+    fn primary_ip_matches_a_capture_device() {
+        let ip =
+            primary_outbound_ip().expect("UDP-connect trick must resolve an outbound IP");
+        assert!(ip.is_ipv4(), "expected IPv4 primary address, got {}", ip);
+        assert!(!ip.is_loopback(), "primary IP must not be loopback");
+
+        let devices = Device::list().expect("Device::list must work unprivileged");
+        let matches: Vec<_> = devices
+            .iter()
+            .filter(|d| d.addresses.iter().any(|a| a.addr == ip))
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "primary IP {} must match exactly one device; found {:?} among {}",
+            ip,
+            matches.iter().map(|d| &d.name).collect::<Vec<_>>(),
+            list_devices().join(" | ")
+        );
+    }
 }

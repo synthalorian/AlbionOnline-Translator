@@ -15,7 +15,7 @@ use tracing::info;
 async fn start_capture(state: State<'_, AppState>) -> Result<String, String> {
     let mut sniffer = state.sniffer.lock().await;
     match sniffer.start() {
-        Ok(_) => Ok("Capture started".to_string()),
+        Ok(device) => Ok(format!("Capture started on {}", device)),
         Err(e) => {
             let mut msg = format!("Failed to start capture: {}", e);
             // The bundled wpcap.dll/Packet.dll only let the app START — actual
@@ -29,6 +29,22 @@ async fn start_capture(state: State<'_, AppState>) -> Result<String, String> {
             Err(msg)
         }
     }
+}
+
+/// Capture diagnostics: (running, packets captured this session). The UI
+/// polls this while capturing — 0 packets means we're on the wrong interface,
+/// >0 with no chat means the decoder/filter is dropping things.
+#[tauri::command]
+async fn get_capture_stats(state: State<'_, AppState>) -> Result<(bool, u64), String> {
+    let sniffer = state.sniffer.lock().await;
+    Ok((sniffer.is_running(), sniffer.packet_count()))
+}
+
+/// All capturable network devices with addresses — diagnostic aid for
+/// wrong-interface captures.
+#[tauri::command]
+async fn list_capture_devices() -> Result<Vec<String>, String> {
+    Ok(crate::sniffer::list_devices())
 }
 
 #[tauri::command]
@@ -209,6 +225,8 @@ pub fn run() {
             start_capture,
             stop_capture,
             get_capture_status,
+            get_capture_stats,
+            list_capture_devices,
             set_target_language,
             get_target_language,
             translate_user_text,

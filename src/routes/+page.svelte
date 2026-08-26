@@ -8,6 +8,9 @@
 
   let settings = $state(loadSettings());
   let isCapturing = $state(false);
+  let captureDevice = $state("");
+  let packetCount = $state(0);
+  let statsTimer = null;
 
   /** @typedef {{ timestamp: string, channel: string, channel_id: number, sender: string, text: string, source_lang?: string, translated_text?: string }} ChatMessage */
   /** @type {ChatMessage[]} */
@@ -164,9 +167,28 @@
       if (isCapturing) {
         await invoke("stop_capture");
         isCapturing = false;
+        captureDevice = "";
+        packetCount = 0;
+        if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
       } else {
-        await invoke("start_capture");
+        // Returns e.g. "Capture started on Realtek PCIe GbE (\Device\NPF_{...})"
+        const started = await invoke("start_capture");
+        captureDevice = String(started).replace(/^Capture started on\s*/, "");
+        packetCount = 0;
         isCapturing = true;
+        // Poll packet count — 0 while chatting = wrong interface.
+        statsTimer = setInterval(async () => {
+          try {
+            const [running, count] = await invoke("get_capture_stats");
+            packetCount = count;
+            if (!running) {
+              isCapturing = false;
+              captureDevice = "";
+              clearInterval(statsTimer);
+              statsTimer = null;
+            }
+          } catch { /* transient — next tick retries */ }
+        }, 2000);
       }
     } catch (e) {
       console.error("Capture toggle failed:", e);
@@ -481,6 +503,11 @@
     <span class="status {isCapturing ? 'online' : 'offline'}">
       {isCapturing ? "● CAPTURING" : "○ IDLE"}
     </span>
+    {#if isCapturing && captureDevice}
+      <span class="capture-detail" title={captureDevice}>
+        {captureDevice} · {packetCount} pkts
+      </span>
+    {/if}
     <div class="lang-picker">
       <button
         class="lang-select"
@@ -895,6 +922,16 @@
   .status {
     font-weight: 600;
     letter-spacing: 0.5px;
+  }
+
+  .capture-detail {
+    font-size: 11px;
+    color: var(--text-secondary, #888);
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: default;
   }
 
   .status.online {
