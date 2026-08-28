@@ -12,7 +12,7 @@ async fn main() {
 
     let (tx, mut rx) = mpsc::channel::<photon::ChatMessage>(100);
     let mut sniffer = PacketSniffer::new(tx);
-    sniffer.start().expect("capture start");
+    sniffer.start(None).expect("capture start");
 
     // Heartbeat: proves whether OTHER tasks get scheduled while the blocking
     // pcap next_packet() loop is running.

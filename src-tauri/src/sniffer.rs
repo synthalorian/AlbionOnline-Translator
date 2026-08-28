@@ -90,6 +90,143 @@ fn device_label(dev: &Device) -> String {
     }
 }
 
+/// VPN/tunnel adapters: WARP, WireGuard, OpenVPN TAP, Tailscale, etc.
+/// Capturing one of these is doubly broken for Albion: the game traffic is
+/// encapsulated+encrypted inside the tunnel, so the Albion-port BPF filter
+/// can never match, and binding the tunnel means we ignore the physical NIC
+/// where split-tunneled (or VPN-disabled) traffic actually flows.
+/// Token-based so "Fortinet" doesn't trip on "tun".
+/// Token-based VPN/tunnel name match, split out for testing — "Fortinet"
+/// must not trip on "tun", but "Cloudflare WARP Interface Tunnel" must flag.
+fn looks_like_tunnel(name: &str, desc: &str) -> bool {
+    let text = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
+    const TOKENS: &[&str] = &[
+        "warp", "wireguard", "wg", "nordlynx", "tailscale", "zerotier",
+        "openvpn", "tap", "tun", "utun", "tunnel", "vpn", "ppp", "wgcf",
+    ];
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| {
+            // "warp" is VPN-specific enough to match inside compounds
+            // (Cloudflare's Linux device is literally "CloudflareWARP").
+            if tok.contains("warp") {
+                return true;
+            }
+            TOKENS.iter().any(|kw| {
+                // Exact ("tun") or keyword + digit suffix ("tun0", "tailscale0", "wg0").
+                tok == *kw
+                    || (tok.starts_with(kw)
+                        && tok.len() > kw.len()
+                        && tok[kw.len()..].chars().all(|c| c.is_ascii_digit()))
+            })
+        })
+}
+
+fn is_tunnel_device(dev: &Device) -> bool {
+    looks_like_tunnel(&dev.name, dev.desc.as_deref().unwrap_or(""))
+}
+
+/// First non-loopback IPv4 address of a device, if any.
+fn first_ipv4(dev: &Device) -> Option<IpAddr> {
+    dev.addresses
+        .iter()
+        .map(|a| a.addr)
+        .find(|a| a.is_ipv4() && !a.is_loopback())
+}
+
+/// Structured device info for the UI picker.
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct CaptureDeviceInfo {
+    /// Raw pcap name — the stable identifier passed back to start_capture.
+    pub name: String,
+    /// Human-readable label for display.
+    pub label: String,
+    /// Heuristic: VPN/tunnel adapter (bad choice for Albion capture).
+    pub is_tunnel: bool,
+    /// First non-loopback IPv4, empty string if none.
+    pub ipv4: String,
+}
+
+/// All capturable devices, structured — feeds the settings interface picker.
+pub fn list_devices_detailed() -> Vec<CaptureDeviceInfo> {
+    Device::list()
+        .map(|devs| {
+            devs.iter()
+                .map(|d| CaptureDeviceInfo {
+                    name: d.name.clone(),
+                    label: device_label(d),
+                    is_tunnel: is_tunnel_device(d),
+                    ipv4: first_ipv4(d)
+                        .map(|a| a.to_string())
+                        .unwrap_or_default(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pick the capture device. `preferred` = raw pcap name from the UI picker.
+///
+/// Auto order: device owning the primary outbound IP → if that's a tunnel,
+/// the first non-tunnel device with a real IPv4 (split-tunnel / VPN-paused
+/// setups) → Device::lookup() as last resort.
+fn select_device(preferred: Option<&str>) -> Result<Device, SnifferError> {
+    let devices = Device::list().map_err(|e| SnifferError::DeviceLookup(e.to_string()))?;
+
+    if let Some(name) = preferred.filter(|n| !n.is_empty()) {
+        let dev = devices
+            .iter()
+            .find(|d| d.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                SnifferError::DeviceLookup(format!(
+                    "selected interface not found: {} (available: {})",
+                    name,
+                    devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>().join(", ")
+                ))
+            })?;
+        if is_tunnel_device(&dev) {
+            info!("Note: manually selected interface looks like a VPN/tunnel adapter");
+        }
+        return Ok(dev);
+    }
+
+    let primary_ip = primary_outbound_ip();
+    if let Some(ip) = primary_ip {
+        info!("Primary outbound IP: {}", ip);
+    }
+
+    let primary_dev = primary_ip.and_then(|ip| {
+        devices
+            .iter()
+            .find(|d| d.addresses.iter().any(|a| a.addr == ip))
+            .cloned()
+    });
+
+    match primary_dev {
+        Some(dev) if !is_tunnel_device(&dev) => Ok(dev),
+        Some(tunnel) => {
+            // The default route lives on a VPN tunnel (Cloudflare WARP etc.).
+            // Albion traffic encapsulated in the tunnel is invisible to our
+            // port filter, so prefer the physical NIC — correct for
+            // split-tunneled games and for a VPN paused after route setup.
+            info!(
+                "Primary outbound device is a VPN/tunnel ({}); preferring physical adapter",
+                device_label(&tunnel)
+            );
+            devices
+                .iter()
+                .find(|d| !is_tunnel_device(d) && first_ipv4(d).is_some())
+                .cloned()
+                .or_else(|| Device::lookup().ok().flatten())
+                .ok_or(SnifferError::NoDevice)
+        }
+        None => Device::lookup()
+            .ok()
+            .flatten()
+            .ok_or(SnifferError::NoDevice),
+    }
+}
+
 /// List all capturable devices with their addresses — for diagnostics and a
 /// future manual picker.
 pub fn list_devices() -> Vec<String> {
@@ -143,27 +280,19 @@ impl PacketSniffer {
 
     /// Start capture. Returns a human-readable label of the device being
     /// listened on, so the UI can show exactly where packets come from.
-    pub fn start(&mut self) -> Result<String, SnifferError> {
+    /// `preferred_device` = raw pcap name from the settings picker (None = auto).
+    pub fn start(&mut self, preferred_device: Option<&str>) -> Result<String, SnifferError> {
         if self.running.load(Ordering::SeqCst) {
             return Err(SnifferError::AlreadyRunning);
         }
 
-        // Pick the interface that owns the machine's primary outbound IP —
-        // Device::lookup() happily returns a VPN/loopback/virtual adapter and
-        // silently captures nothing, and Windows has no `ip route` to parse.
-        // The UDP-connect trick works identically on Linux and Windows.
-        let primary_ip = primary_outbound_ip();
-        if let Some(ip) = primary_ip {
-            info!("Primary outbound IP: {}", ip);
-        }
-
-        let devices = Device::list().map_err(|e| SnifferError::DeviceLookup(e.to_string()))?;
-        let device = devices
-            .iter()
-            .find(|d| d.addresses.iter().any(|a| Some(a.addr) == primary_ip))
-            .cloned()
-            .or_else(|| Device::lookup().ok().flatten())
-            .ok_or(SnifferError::NoDevice)?;
+        // Auto: the interface owning the primary outbound IP — Device::lookup()
+        // happily returns a VPN/loopback/virtual adapter and silently captures
+        // nothing, and Windows has no `ip route` to parse. The UDP-connect
+        // trick works identically on Linux and Windows. If the primary device
+        // is a VPN tunnel (Cloudflare WARP…), prefer the physical NIC instead —
+        // tunnel-encapsulated Albion traffic can never match our port filter.
+        let device = select_device(preferred_device)?;
 
         let label = device_label(&device);
         info!("Using device: {}", label);
@@ -379,6 +508,33 @@ pub enum SnifferError {
 #[cfg(test)]
 mod device_selection_tests {
     use super::*;
+
+    #[test]
+    fn tunnel_heuristic_flags_vpn_adapters() {
+        // Ola's actual adapter (2026-08): must flag.
+        assert!(looks_like_tunnel(
+            "\\Device\\NPF_{D8484304-D804-6AA0-A33D-72368368364D}",
+            "Cloudflare WARP Interface Tunnel"
+        ));
+        assert!(looks_like_tunnel("wg0", "WireGuard Tunnel"));
+        assert!(looks_like_tunnel("tailscale0", ""));
+        assert!(looks_like_tunnel("", "TAP-Windows Adapter V9"));
+        assert!(looks_like_tunnel("tun0", ""));
+        assert!(looks_like_tunnel("CloudflareWARP", ""));
+    }
+
+    #[test]
+    fn tunnel_heuristic_ignores_physical_adapters() {
+        assert!(!looks_like_tunnel(
+            "\\Device\\NPF_{88FA266C-1A3A-4044-BEE5-B452A5C4A23F}",
+            "Intel(R) Wi-Fi 6 AX201 160MHz"
+        ));
+        assert!(!looks_like_tunnel("enp0s31f6", ""));
+        assert!(!looks_like_tunnel("eth0", "Realtek PCIe GbE Family Controller"));
+        // Substring traps: "tun" in Fortinet, "tap" in… nothing common, but
+        // tokenization must protect us regardless.
+        assert!(!looks_like_tunnel("", "Fortinet Ethernet Adapter"));
+    }
 
     /// The UDP-connect trick must yield a real local IPv4, and that IP
     /// must belong to exactly one capturable device — the selection logic

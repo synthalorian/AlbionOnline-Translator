@@ -14,6 +14,8 @@ const defaultSettings = {
   theme: 'synthwave-84',
   targetLanguage: 'en',
   userTargetLanguage: 'es',
+  // Raw pcap device name for capture; '' = auto-detect (skips VPN tunnels).
+  captureInterface: '',
   // Per-channel visibility toggles — every Albion chat channel, all on by default.
   // Language channels (English, Español, etc.) are dropped at decode time.
   channelFilters: {

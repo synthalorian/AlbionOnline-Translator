@@ -20,6 +20,8 @@
   let currentTheme = $state(settings.theme || getStoredTheme());
   let showThemePicker = $state(false);
   let showSettings = $state(false);
+  /** @type {{name: string, label: string, is_tunnel: boolean, ipv4: string}[]} */
+  let captureDevices = $state([]);
   let checkingUpdates = $state(false);
   let updateStatus = $state("");
   let compactMode = $state(false);
@@ -172,7 +174,9 @@
         if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
       } else {
         // Returns e.g. "Capture started on Realtek PCIe GbE (\Device\NPF_{...})"
-        const started = await invoke("start_capture");
+        const started = await invoke("start_capture", {
+          device: settings.captureInterface || null,
+        });
         captureDevice = String(started).replace(/^Capture started on\s*/, "");
         packetCount = 0;
         isCapturing = true;
@@ -300,6 +304,32 @@
       console.error("Click-through toggle failed:", e);
       // Revert on failure
       settings.clickThrough = !settings.clickThrough;
+    }
+  }
+
+  async function loadCaptureDevices() {
+    try {
+      captureDevices = await invoke("list_capture_devices");
+      // Saved interface vanished (VPN uninstalled, adapter renamed) → auto.
+      if (
+        settings.captureInterface &&
+        !captureDevices.some((d) => d.name === settings.captureInterface)
+      ) {
+        settings.captureInterface = "";
+        saveSettings(settings);
+      }
+    } catch (e) {
+      console.error("Failed to list capture devices:", e);
+      captureDevices = [];
+    }
+  }
+
+  async function changeCaptureInterface() {
+    saveSettings(settings);
+    // Apply immediately: restart capture on the newly selected interface.
+    if (isCapturing) {
+      await toggleCapture(); // stop
+      await toggleCapture(); // start with new device
     }
   }
 
@@ -462,6 +492,29 @@
           <input type="checkbox" bind:checked={settings.clickThrough} onchange={toggleClickThrough} />
           <span>Click-Through (mouse passes to game)</span>
         </label>
+      </div>
+
+      <div class="setting-row">
+        <label style="display: block; margin-bottom: 4px;">Capture Interface</label>
+        <select
+          bind:value={settings.captureInterface}
+          onchange={changeCaptureInterface}
+          onfocus={loadCaptureDevices}
+          style="width: 100%; padding: 6px 8px; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-color); border-radius: 6px;"
+        >
+          <option value="">Auto-detect (skips VPN tunnels)</option>
+          {#each captureDevices as dev}
+            <option value={dev.name}>
+              {dev.is_tunnel ? "⚠ VPN: " : ""}{dev.label}{dev.ipv4 ? ` — ${dev.ipv4}` : ""}
+            </option>
+          {/each}
+        </select>
+        {#if captureDevices.some((d) => d.is_tunnel)}
+          <span style="font-size: 10px; color: var(--text-muted);">
+            ⚠ VPN adapters can't see game chat — traffic is encrypted inside the tunnel.
+            Pick your physical Wi-Fi/Ethernet adapter (and split-tunnel Albion if the VPN stays on).
+          </span>
+        {/if}
       </div>
 
       <div class="setting-row" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
