@@ -22,6 +22,9 @@
   let showSettings = $state(false);
   /** @type {{name: string, label: string, is_tunnel: boolean, ipv4: string}[]} */
   let captureDevices = $state([]);
+  let diagRunning = $state(false);
+  /** @type {string} */
+  let diagResult = $state("");
   let checkingUpdates = $state(false);
   let updateStatus = $state("");
   let compactMode = $state(false);
@@ -333,6 +336,36 @@
     }
   }
 
+  async function runDiagnostic() {
+    diagRunning = true;
+    diagResult = "";
+    try {
+      // Stop capture so the diagnostic can open the device.
+      const wasCapturing = isCapturing;
+      if (wasCapturing) await toggleCapture();
+      const r = await invoke("run_network_diagnostic", {
+        device: settings.captureInterface || null,
+      });
+      const ports = r.top_udp_ports.map(([p, n]) => `${p}×${n}`).join(", ");
+      let verdict;
+      if (r.total_packets === 0) {
+        verdict = "❌ No packets at all — capture driver (Npcap) or adapter is broken.";
+      } else if (r.albion_packets > 0) {
+        verdict = "✅ Albion traffic IS arriving — any silence is a decoder issue. Report this!";
+      } else {
+        verdict = "⚠️ Capture works, but no Albion traffic on this adapter — a VPN is likely still routing the game (port 2408 = WARP/WireGuard), or Albion isn't chatting.";
+      }
+      diagResult =
+        `${r.device}\n10s survey: ${r.total_packets} total, ${r.udp_packets} UDP, ` +
+        `${r.albion_packets} Albion-port\nTop UDP ports: ${ports || "none"}\n${verdict}`;
+      if (wasCapturing) await toggleCapture();
+    } catch (e) {
+      diagResult = "Diagnostic failed: " + e;
+    } finally {
+      diagRunning = false;
+    }
+  }
+
   function exportChatLog() {
     const lines = messages.map((m) => {
       const translated = m.translated_text && m.translated_text !== m.text
@@ -517,6 +550,15 @@
         {/if}
       </div>
 
+      <div class="setting-row">
+        <button class="setup-btn" style="width: 100%;" onclick={runDiagnostic} disabled={diagRunning}>
+          {diagRunning ? "Surveying network… (10s)" : "Run Network Diagnostic"}
+        </button>
+        {#if diagResult}
+          <pre style="font-size: 10px; color: var(--text-secondary, #aaa); white-space: pre-wrap; margin-top: 6px; user-select: text;">{diagResult}</pre>
+        {/if}
+      </div>
+
       <div class="setting-row" style="margin-top: 12px; border-top: 1px solid var(--border-color); padding-top: 12px;">
         <button class="setup-btn" style="width: 100%;" onclick={checkUpdates} disabled={checkingUpdates}>
           {checkingUpdates ? "Checking…" : updateStatus || "Check for Updates"}
@@ -557,8 +599,9 @@
       {isCapturing ? "● CAPTURING" : "○ IDLE"}
     </span>
     {#if isCapturing && captureDevice}
-      <span class="capture-detail" title={captureDevice}>
-        {captureDevice} · {packetCount} pkts
+      <span class="capture-detail" title="{captureDevice} · {packetCount} pkts">
+        <span class="capture-count">{packetCount} pkts</span>
+        <span class="capture-name"> · {captureDevice}</span>
       </span>
     {/if}
     <div class="lang-picker">
@@ -985,6 +1028,13 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     cursor: default;
+  }
+
+  /* The count is the diagnostic gold — never let ellipsis eat it. Truncate
+     the adapter name instead. (Burned 2026-08-28: long Intel name hid the
+     pkts counter behind "…", blocking remote diagnosis.) */
+  .capture-count {
+    font-weight: 600;
   }
 
   .status.online {

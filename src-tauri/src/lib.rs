@@ -48,6 +48,25 @@ async fn list_capture_devices() -> Result<Vec<crate::sniffer::CaptureDeviceInfo>
     Ok(crate::sniffer::list_devices_detailed())
 }
 
+/// 10-second unfiltered packet survey — triangulates "CAPTURING but no
+/// messages": total==0 → driver/adapter broken; udp>0 & albion==0 → traffic
+/// not on this adapter (VPN); albion>0 → decoder issue. Runs on the blocking
+/// pool; refuses while the main capture is active.
+#[tauri::command]
+async fn run_network_diagnostic(
+    state: State<'_, AppState>,
+    device: Option<String>,
+) -> Result<crate::sniffer::DiagReport, String> {
+    let busy = {
+        let sniffer = state.sniffer.lock().await;
+        sniffer.is_running()
+    };
+    tokio::task::spawn_blocking(move || crate::sniffer::run_diagnostic(device.as_deref(), 10, busy))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 async fn stop_capture(state: State<'_, AppState>) -> Result<String, String> {
     let mut sniffer = state.sniffer.lock().await;
@@ -228,6 +247,7 @@ pub fn run() {
             get_capture_status,
             get_capture_stats,
             list_capture_devices,
+            run_network_diagnostic,
             set_target_language,
             get_target_language,
             translate_user_text,
