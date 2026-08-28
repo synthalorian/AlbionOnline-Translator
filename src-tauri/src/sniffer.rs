@@ -125,12 +125,20 @@ fn is_tunnel_device(dev: &Device) -> bool {
     looks_like_tunnel(&dev.name, dev.desc.as_deref().unwrap_or(""))
 }
 
-/// First non-loopback IPv4 address of a device, if any.
+/// Is this address usable as evidence of a real network? Excludes loopback
+/// AND link-local (169.254.x.x = "unplugged/unconfigured") — a Bluetooth PAN
+/// with a link-local address beat the real Wi-Fi adapter in fallback
+/// selection (burned 2026-08-28, Ola's machine).
+fn usable_ipv4(addr: &IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(v4) => !v4.is_loopback() && !v4.is_link_local() && !v4.is_unspecified(),
+        _ => false,
+    }
+}
+
+/// First non-loopback, non-link-local IPv4 address of a device, if any.
 fn first_ipv4(dev: &Device) -> Option<IpAddr> {
-    dev.addresses
-        .iter()
-        .map(|a| a.addr)
-        .find(|a| a.is_ipv4() && !a.is_loopback())
+    dev.addresses.iter().map(|a| a.addr).find(usable_ipv4)
 }
 
 /// Structured device info for the UI picker.
@@ -534,6 +542,21 @@ mod device_selection_tests {
         // Substring traps: "tun" in Fortinet, "tap" in… nothing common, but
         // tokenization must protect us regardless.
         assert!(!looks_like_tunnel("", "Fortinet Ethernet Adapter"));
+    }
+
+    #[test]
+    fn usable_ipv4_rejects_loopback_and_linklocal() {
+        use std::net::Ipv4Addr;
+        // Ola's actual adapter table (2026-08): Bluetooth PAN 169.254.44.80
+        // and unplugged Realtek 169.254.193.51 must NOT qualify; the Intel
+        // Wi-Fi at 192.168.10.25 must.
+        assert!(!usable_ipv4(&IpAddr::V4(Ipv4Addr::new(169, 254, 44, 80))));
+        assert!(!usable_ipv4(&IpAddr::V4(Ipv4Addr::new(169, 254, 193, 51))));
+        assert!(!usable_ipv4(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!usable_ipv4(&IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(usable_ipv4(&IpAddr::V4(Ipv4Addr::new(192, 168, 10, 25))));
+        // IPv6 never qualifies as the primary evidence address.
+        assert!(!usable_ipv4(&"fe80::1".parse::<IpAddr>().unwrap()));
     }
 
     /// The UDP-connect trick must yield a real local IPv4, and that IP
