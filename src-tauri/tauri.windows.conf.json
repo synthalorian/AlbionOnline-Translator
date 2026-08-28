@@ -3,6 +3,11 @@
     "resources": {
       "resources/wpcap.dll": "./",
       "resources/Packet.dll": "./"
+    },
+    "windows": {
+      "nsis": {
+        "installerHooks": "nsis/installer-hooks.nsh"
+      }
     }
   }
 }
