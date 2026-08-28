@@ -12,9 +12,9 @@ use tokio::sync::mpsc;
 use tracing::info;
 
 #[tauri::command]
-async fn start_capture(state: State<'_, AppState>) -> Result<String, String> {
+async fn start_capture(state: State<'_, AppState>, device: Option<String>) -> Result<String, String> {
     let mut sniffer = state.sniffer.lock().await;
-    match sniffer.start() {
+    match sniffer.start(device.as_deref()) {
         Ok(device) => Ok(format!("Capture started on {}", device)),
         Err(e) => {
             let mut msg = format!("Failed to start capture: {}", e);
@@ -40,11 +40,12 @@ async fn get_capture_stats(state: State<'_, AppState>) -> Result<(bool, u64), St
     Ok((sniffer.is_running(), sniffer.packet_count()))
 }
 
-/// All capturable network devices with addresses — diagnostic aid for
-/// wrong-interface captures.
+/// All capturable network devices (structured) — feeds the settings
+/// interface picker. `is_tunnel` flags VPN adapters that can't see Albion
+/// traffic (encapsulated), `name` is the value to pass back to start_capture.
 #[tauri::command]
-async fn list_capture_devices() -> Result<Vec<String>, String> {
-    Ok(crate::sniffer::list_devices())
+async fn list_capture_devices() -> Result<Vec<crate::sniffer::CaptureDeviceInfo>, String> {
+    Ok(crate::sniffer::list_devices_detailed())
 }
 
 #[tauri::command]
