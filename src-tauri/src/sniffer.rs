@@ -172,6 +172,89 @@ pub fn list_devices_detailed() -> Vec<CaptureDeviceInfo> {
         .unwrap_or_default()
 }
 
+const ALBION_PORTS: [u16; 3] = [5055, 5056, 4535];
+
+/// Result of the 10-second network diagnostic. The three counters triangulate
+/// every "CAPTURING but no messages" report:
+///   total == 0            → Npcap/driver/adapter capture is broken outright
+///   total > 0, albion == 0 → capture works; game traffic isn't on this adapter
+///                            (VPN tunnel, or the game isn't chatting)
+///   albion > 0            → traffic arrives; any silence is the decoder
+/// top_udp_ports reveals WHERE traffic actually goes (2408 = WireGuard/WARP,
+/// 443 = QUIC, 53 = DNS) — the smoking gun for "the VPN is secretly still on".
+#[derive(serde::Serialize, Clone, Debug)]
+pub struct DiagReport {
+    pub device: String,
+    pub duration_secs: u64,
+    pub total_packets: u64,
+    pub udp_packets: u64,
+    pub albion_packets: u64,
+    pub top_udp_ports: Vec<(u16, u64)>,
+}
+
+/// Blocking packet survey on the selected (or auto) device with NO filter.
+/// Call from spawn_blocking. Fails if the main capture is running.
+pub fn run_diagnostic(
+    preferred_device: Option<&str>,
+    duration_secs: u64,
+    capture_busy: bool,
+) -> Result<DiagReport, SnifferError> {
+    if capture_busy {
+        return Err(SnifferError::AlreadyRunning);
+    }
+    let device = select_device(preferred_device)?;
+    let label = device_label(&device);
+    info!("Diagnostic capture on {} for {}s", label, duration_secs);
+
+    let mut cap = Capture::from_device(device)
+        .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?
+        .promisc(true)
+        .snaplen(65535)
+        .timeout(1000)
+        .open()
+        .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
+    // Deliberately NO BPF filter: we want to see everything the adapter sees.
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
+    let mut total = 0u64;
+    let mut udp = 0u64;
+    let mut albion = 0u64;
+    let mut port_counts: HashMap<u16, u64> = HashMap::new();
+
+    while std::time::Instant::now() < deadline {
+        match cap.next_packet() {
+            Ok(packet) => {
+                total += 1;
+                if let Some((_, _, sp, dp, _)) = crate::network::extract_udp_packet(packet.data) {
+                    udp += 1;
+                    if ALBION_PORTS.contains(&sp) || ALBION_PORTS.contains(&dp) {
+                        albion += 1;
+                    }
+                    // The lower port is usually the service port (53/443/2408…).
+                    *port_counts.entry(sp.min(dp)).or_insert(0) += 1;
+                }
+            }
+            Err(pcap::Error::TimeoutExpired) => continue,
+            Err(_) => break,
+        }
+    }
+
+    let mut top: Vec<(u16, u64)> = port_counts.into_iter().collect();
+    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.truncate(5);
+
+    let report = DiagReport {
+        device: label,
+        duration_secs,
+        total_packets: total,
+        udp_packets: udp,
+        albion_packets: albion,
+        top_udp_ports: top,
+    };
+    info!("Diagnostic result: {:?}", report);
+    Ok(report)
+}
+
 /// Pick the capture device. `preferred` = raw pcap name from the UI picker.
 ///
 /// Auto order: device owning the primary outbound IP → if that's a tunnel,

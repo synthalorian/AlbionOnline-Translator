@@ -154,6 +154,22 @@ fn extract_udp_payload_ipv6(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     Some((src_ip, dst_ip, payload))
 }
 
+/// Like extract_udp_payload but also returns the UDP ports — used by the
+/// network diagnostic to identify what traffic IS flowing when Albion's
+/// isn't. Returns (src_ip, dst_ip, src_port, dst_port, payload).
+pub fn extract_udp_packet(data: &[u8]) -> Option<(IpAddr, IpAddr, u16, u16, &[u8])> {
+    let (src_ip, dst_ip, payload) = extract_udp_payload(data)?;
+    // Ports live 8 bytes before the payload: [src_port(2) dst_port(2) len checksum]
+    let payload_off = unsafe { payload.as_ptr().offset_from(data.as_ptr()) } as usize;
+    if payload_off < UDP_HEADER_LEN {
+        return None;
+    }
+    let udp_off = payload_off - UDP_HEADER_LEN;
+    let src_port = u16::from_be_bytes([data[udp_off], data[udp_off + 1]]);
+    let dst_port = u16::from_be_bytes([data[udp_off + 2], data[udp_off + 3]]);
+    Some((src_ip, dst_ip, src_port, dst_port, payload))
+}
+
 /// Extract UDP payload from a raw ethernet frame (what pcap hands us).
 /// Tries IPv4 first, then IPv6. Returns None if the frame isn't IP/UDP.
 pub fn extract_udp_payload(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
