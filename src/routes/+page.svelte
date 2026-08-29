@@ -350,14 +350,22 @@
       let verdict;
       if (r.total_packets === 0) {
         verdict = "❌ No packets at all — capture driver (Npcap) or adapter is broken.";
+      } else if (r.albion_packets > 0 && r.photon_chat_decoded > 0) {
+        verdict = "✅ Chat decoded during the survey — if the feed stayed empty, it's a UI bug. Report this!";
+      } else if (r.albion_packets > 0 && r.albion_encrypted >= r.albion_packets / 2) {
+        verdict = "❌ Albion traffic is Photon-ENCRYPTED on this connection — decoder can't read it. Report this!";
+      } else if (r.albion_packets > 0 && r.albion_inbound === 0 && r.albion_outbound > 0) {
+        verdict = "⚠️ ONE-WAY capture: only OUTBOUND game packets visible — inbound never reaches us. Fully QUIT any VPN/filter software (WARP, antivirus web shields), or reinstall Npcap with 'Support raw 802.11 traffic' checked.";
       } else if (r.albion_packets > 0) {
-        verdict = "✅ Albion traffic IS arriving — any silence is a decoder issue. Report this!";
+        verdict = "⚠️ Game traffic arrives but no chat decoded in 10s — chat in-game during the survey and re-run. Still zero = protocol change, report this!";
       } else {
         verdict = "⚠️ Capture works, but no Albion traffic on this adapter — a VPN is likely still routing the game (port 2408 = WARP/WireGuard), or Albion isn't chatting.";
       }
       diagResult =
         `${r.device}\n10s survey: ${r.total_packets} total, ${r.udp_packets} UDP, ` +
-        `${r.albion_packets} Albion-port\nTop UDP ports: ${ports || "none"}\n${verdict}`;
+        `${r.albion_packets} Albion-port (in ${r.albion_inbound} / out ${r.albion_outbound})\n` +
+        `Photon: ${r.albion_encrypted} encrypted, ${r.photon_chat_decoded} chat decoded\n` +
+        `Top UDP ports: ${ports || "none"}\n${verdict}`;
       if (wasCapturing) await toggleCapture();
     } catch (e) {
       diagResult = "Diagnostic failed: " + e;

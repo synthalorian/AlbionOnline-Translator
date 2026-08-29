@@ -190,6 +190,21 @@ pub struct DiagReport {
     pub udp_packets: u64,
     pub albion_packets: u64,
     pub top_udp_ports: Vec<(u16, u64)>,
+    // v0.2.11: pinpoint WHERE the decode chain breaks when albion > 0.
+    /// Albion packets whose dst IP belongs to this adapter (server → client).
+    /// Chat events ONLY arrive inbound, so inbound == 0 with outbound > 0 is
+    /// the "one-way capture" smoking gun (VPN/WFP filter, Wi-Fi driver mode).
+    pub albion_inbound: u64,
+    pub albion_outbound: u64,
+    /// Photon packets with flags == 1 (payload encrypted at the Photon layer).
+    /// The decoder skips these by design; encrypted == albion means Albion
+    /// turned on Photon encryption for this connection and the decoder needs
+    /// a whole new feature, not a bugfix.
+    pub albion_encrypted: u64,
+    /// Chat messages the Photon decoder actually produced during the survey.
+    /// > 0 with a silent UI = the pipeline works and the bug is in the UI/event
+    /// path. == 0 with healthy inbound = protocol change or a quiet 10s window.
+    pub photon_chat_decoded: u64,
 }
 
 /// Blocking packet survey on the selected (or auto) device with NO filter.
@@ -204,6 +219,7 @@ pub fn run_diagnostic(
     }
     let device = select_device(preferred_device)?;
     let label = device_label(&device);
+    let local_ips: Vec<IpAddr> = device.addresses.iter().map(|a| a.addr).collect();
     info!("Diagnostic capture on {} for {}s", label, duration_secs);
 
     let mut cap = Capture::from_device(device)
@@ -219,16 +235,36 @@ pub fn run_diagnostic(
     let mut total = 0u64;
     let mut udp = 0u64;
     let mut albion = 0u64;
+    let mut inbound = 0u64;
+    let mut outbound = 0u64;
+    let mut encrypted = 0u64;
+    let mut chat_decoded = 0u64;
     let mut port_counts: HashMap<u16, u64> = HashMap::new();
+    // Full decoder over the survey traffic — the same code path the live
+    // capture uses, so its verdict transfers directly.
+    let mut decoder = PhotonDecoder::with_channel_map(Arc::new(StdMutex::new(HashMap::new())));
 
     while std::time::Instant::now() < deadline {
         match cap.next_packet() {
             Ok(packet) => {
                 total += 1;
-                if let Some((_, _, sp, dp, _)) = crate::network::extract_udp_packet(packet.data) {
+                if let Some((src_ip, dst_ip, sp, dp, payload)) =
+                    crate::network::extract_udp_packet(packet.data)
+                {
                     udp += 1;
                     if ALBION_PORTS.contains(&sp) || ALBION_PORTS.contains(&dp) {
                         albion += 1;
+                        if local_ips.contains(&dst_ip) {
+                            inbound += 1;
+                        } else if local_ips.contains(&src_ip) {
+                            outbound += 1;
+                        }
+                        // Mirror PhotonDecoder::decode's encryption skip.
+                        if payload.len() >= 12 && payload[2] == 1 {
+                            encrypted += 1;
+                        } else if decoder.decode(payload).is_some() {
+                            chat_decoded += 1;
+                        }
                     }
                     // The lower port is usually the service port (53/443/2408…).
                     *port_counts.entry(sp.min(dp)).or_insert(0) += 1;
@@ -250,6 +286,10 @@ pub fn run_diagnostic(
         udp_packets: udp,
         albion_packets: albion,
         top_udp_ports: top,
+        albion_inbound: inbound,
+        albion_outbound: outbound,
+        albion_encrypted: encrypted,
+        photon_chat_decoded: chat_decoded,
     };
     info!("Diagnostic result: {:?}", report);
     Ok(report)
