@@ -270,6 +270,32 @@ export const themes = {
     }
   },
 
+  // === BLACKSHIELD ===
+  'blackshield': {
+    name: 'Blackshield',
+    emoji: '🛡️',
+    description: 'Steel and blood. Forged for the mercenary who answers to no crown.',
+    category: 'blackshield',
+    colors: {
+      '--bg-primary': 'rgba(16, 16, 20, 0.95)',
+      '--bg-secondary': 'rgba(22, 22, 28, 0.85)',
+      '--bg-tertiary': 'rgba(26, 26, 32, 0.75)',
+      '--bg-message': 'rgba(26, 26, 32, 0.6)',
+      '--border-color': 'rgba(193, 18, 31, 0.25)',
+      '--border-glow': 'rgba(193, 18, 31, 0.4)',
+      '--text-primary': '#d8d3c8',
+      '--text-secondary': '#b3aea2',
+      '--text-muted': '#8a8f98',
+      '--accent-primary': '#c1121f',
+      '--accent-secondary': '#7b9dc4',
+      '--accent-glow': '#c1121f',
+      '--status-online': '#6a994e',
+      '--status-offline': '#8a8f98',
+      '--scrollbar-thumb': 'rgba(193, 18, 31, 0.35)',
+      '--scrollbar-track': 'rgba(22, 22, 28, 0.4)',
+    }
+  },
+
   // === CLASSIC ===
   'dark-mocha': {
     name: 'Dark (Mocha)',
@@ -324,6 +350,7 @@ export const themes = {
 export const themeCategories = {
   synthwave: { name: 'Synthwave', emoji: '🌆' },
   albion: { name: 'Albion Cities', emoji: '⚔️' },
+  blackshield: { name: 'Blackshield', emoji: '🛡️' },
   classic: { name: 'Classic', emoji: '🎨' },
 };
 
@@ -351,5 +378,5 @@ export function applyTheme(themeId) {
 }
 
 export function getStoredTheme() {
-  return localStorage.getItem('albion-translator-theme') || 'synthwave-84';
+  return localStorage.getItem('albion-translator-theme') || 'blackshield';
 }
