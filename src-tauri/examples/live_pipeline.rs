@@ -33,7 +33,7 @@ async fn main() {
             "[{}] {} | {} | {:?} => {:?}",
             n, msg.channel, msg.sender, msg.text, msg.translated_text
         );
-        if n >= 10 {
+        if n >= 100000 {
             break;
         }
     }

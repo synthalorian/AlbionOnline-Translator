@@ -171,6 +171,11 @@ pub struct PhotonDecoder {
     // Dedup: track recent message hashes to drop duplicate captures
     // (same packet seen on multiple interfaces, or server double-send)
     recent_messages: std::collections::VecDeque<(u64, std::time::Instant)>,
+    // Cross-channel echo dedup (2026-09-07): Albion added overhead chat
+    // bubbles for party chat, so a party line now arrives TWICE — once as
+    // ChatMessage (73, party channel) and once as ChatSay (74, the bubble).
+    // Keyed on (sender, text) only; first arrival in ANY channel wins.
+    recent_any: std::collections::VecDeque<(u64, std::time::Instant)>,
 }
 
 impl PhotonDecoder {
@@ -182,6 +187,7 @@ impl PhotonDecoder {
             channel_map: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             fragments: FragmentReassembler::new(),
             recent_messages: std::collections::VecDeque::new(),
+            recent_any: std::collections::VecDeque::new(),
         }
     }
 
@@ -193,6 +199,7 @@ impl PhotonDecoder {
             channel_map: map,
             fragments: FragmentReassembler::new(),
             recent_messages: std::collections::VecDeque::new(),
+            recent_any: std::collections::VecDeque::new(),
         }
     }
 
@@ -227,6 +234,32 @@ impl PhotonDecoder {
             self.recent_messages.pop_front();
         }
         self.recent_messages.push_back((hash, now));
+        false
+    }
+
+    /// Cross-channel echo dedup: same (sender, text) seen in ANY channel
+    /// within the window. Drops Albion's 2026-09 party-bubble double-publish
+    /// (party ChatMessage + ChatSay echo) regardless of arrival order.
+    fn is_duplicate_any(&mut self, sender: &str, text: &str) -> bool {
+        let hash = Self::hash_message(i64::MIN, sender, text);
+        let now = std::time::Instant::now();
+
+        while let Some((_, ts)) = self.recent_any.front() {
+            if now.duration_since(*ts).as_millis() > Self::DEDUP_WINDOW_MS {
+                self.recent_any.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.recent_any.iter().any(|(h, _)| *h == hash) {
+            return true;
+        }
+
+        if self.recent_any.len() >= Self::DEDUP_CAPACITY {
+            self.recent_any.pop_front();
+        }
+        self.recent_any.push_back((hash, now));
         false
     }
 
@@ -548,6 +581,11 @@ impl PhotonDecoder {
         if self.is_duplicate(channel_id, &player_name, &message) {
             return None;
         }
+        // Cross-channel echo dedup: Albion's 2026-09 overhead bubbles
+        // re-publish party chat as ChatSay — first arrival wins.
+        if self.is_duplicate_any(&player_name, &message) {
+            return None;
+        }
 
         let channel = self.map_channel(channel_id);
         // Language channels (English, Español, etc.) are dropped — they don't
@@ -598,6 +636,10 @@ impl PhotonDecoder {
         if self.is_duplicate(0, &player_name, &message) {
             return None;
         }
+        // Cross-channel echo dedup (party-bubble double publish)
+        if self.is_duplicate_any(&player_name, &message) {
+            return None;
+        }
 
         let now = chrono::Local::now();
 
@@ -613,16 +655,26 @@ impl PhotonDecoder {
     }
 
     fn decode_chat_whisper(&mut self, params: &HashMap<u8, serde_json::Value>) -> Option<ChatMessage> {
-        // ChatWhisper event structure (live-verified 2026-08-15):
+        // ChatWhisper event structure:
         //   param 0: sender name (string)
-        //   param 2: message (string)
-        //   param 3: 0 (unknown flag)
+        //   param 2: message (string) — live-verified 2026-08-15
+        //   param 3: message (string) — live-verified 2026-09-07: Albion MOVED
+        //     the text to key 3 (key 2 absent on the wire; key 4 carries a
+        //     small flag). Support both; prefer whichever is present.
         //   param 252: 75 (event code, always present)
         let player_name = params.get(&0)?.as_str()?.to_string();
-        let message = params.get(&2)?.as_str()?.to_string();
+        let message = params
+            .get(&3)
+            .and_then(|v| v.as_str())
+            .or_else(|| params.get(&2).and_then(|v| v.as_str()))?
+            .to_string();
 
         // Dedup: drop duplicate whisper captures
         if self.is_duplicate(-1, &player_name, &message) {
+            return None;
+        }
+        // Cross-channel echo dedup (consistent with 73/74 paths)
+        if self.is_duplicate_any(&player_name, &message) {
             return None;
         }
 
@@ -1286,6 +1338,47 @@ mod tests {
     }
 
     #[test]
+    fn party_bubble_echo_dedup_cross_channel() {
+        // 2026-09: Albion's overhead bubbles re-publish party chat as ChatSay
+        // (74) alongside the real ChatMessage (73). Same sender+text must
+        // appear ONCE regardless of arrival order.
+        let chat_params = [
+            0x03,
+            0x00, 0x0A, 0x2A, // key 0, compressed i64, channel_id 42 (party-ish)
+            0x01, 0x07, 0x04, b'A', b'l', b'b', b'i', // key 1, "Albi"
+            0x02, 0x07, 0x05, b'H', b'e', b'l', b'l', b'o', // key 2, "Hello"
+        ];
+        let say_params = [
+            0x02,
+            0x00, 0x07, 0x04, b'A', b'l', b'b', b'i', // key 0, "Albi"
+            0x01, 0x07, 0x05, b'H', b'e', b'l', b'l', b'o', // key 1, "Hello"
+        ];
+
+        // order 1: party first, bubble second → bubble dropped
+        let mut d1 = PhotonDecoder::new();
+        let first = d1.decode(&build_chat_packet(73, &chat_params));
+        assert!(first.is_some(), "party message should decode");
+        let echo = d1.decode(&build_chat_packet(74, &say_params));
+        assert!(echo.is_none(), "say bubble echo must be dropped");
+
+        // order 2: bubble first, party second → party copy dropped
+        let mut d2 = PhotonDecoder::new();
+        let first2 = d2.decode(&build_chat_packet(74, &say_params));
+        assert!(first2.is_some(), "say bubble should decode");
+        let echo2 = d2.decode(&build_chat_packet(73, &chat_params));
+        assert!(echo2.is_none(), "party echo of the bubble must be dropped");
+
+        // different text from same sender is NOT an echo
+        let other_params = [
+            0x02,
+            0x00, 0x07, 0x04, b'A', b'l', b'b', b'i',
+            0x01, 0x07, 0x02, b'h', b'i',
+        ];
+        let third = d2.decode(&build_chat_packet(74, &other_params));
+        assert!(third.is_some(), "new text must decode");
+    }
+
+    #[test]
     fn decodes_chat_whisper_event() {
         // ChatWhisper (75): param 0 = sender, param 2 = message
         // (live-verified 2026-08-15: {"0":"sender","2":"msg","3":0,"252":75})
@@ -1297,6 +1390,26 @@ mod tests {
         ];
         let mut decoder = PhotonDecoder::new();
         let msg = decoder.decode(&build_chat_packet(75, &params)).expect("chat whisper");
+
+        assert_eq!(msg.sender, "Albi");
+        assert_eq!(msg.text, "Hello");
+        assert_eq!(msg.channel, ChatChannel::Whisper);
+    }
+
+    #[test]
+    fn decodes_chat_whisper_event_post_2026_09_layout() {
+        // Albion moved the whisper text from key 2 to key 3 (live-verified
+        // 2026-09-07, wire capture of a self-whisper):
+        //   {"0":"synthalorian","3":"test","4":34,"252":75} — key 2 ABSENT.
+        // Before the fallback, decode returned None and whispers silently died.
+        let params = [
+            0x03, // param table size (3 params; builder appends the 252 entry)
+            0x00, 0x07, 0x04, b'A', b'l', b'b', b'i', // key 0, string "Albi"
+            0x03, 0x07, 0x05, b'H', b'e', b'l', b'l', b'o', // key 3, string "Hello"
+            0x04, 0x0B, 0x22, // key 4, u8, value 0x22
+        ];
+        let mut decoder = PhotonDecoder::new();
+        let msg = decoder.decode(&build_chat_packet(75, &params)).expect("chat whisper (new layout)");
 
         assert_eq!(msg.sender, "Albi");
         assert_eq!(msg.text, "Hello");
