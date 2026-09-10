@@ -119,6 +119,23 @@ On Linux, grant capture capabilities to avoid running as root:
 sudo setcap cap_net_raw,cap_net_admin=eip ./src-tauri/target/release/albion-translator
 ```
 
+### Linux (Wayland): Missing Titlebar / Window Controls
+
+On Wayland sessions (KDE Plasma, GNOME), Tauri windows may render without the
+system titlebar — no minimize/maximize/close buttons — because native-Wayland
+clients don't receive KWin's server-side decorations. The fix is to run the app
+through XWayland:
+
+```bash
+GDK_BACKEND=x11 ./albion-translator
+```
+
+For a permanent fix, edit the `.desktop` entry:
+
+```ini
+Exec=env GDK_BACKEND=x11 /path/to/albion-translator
+```
+
 ## Roadmap
 
 - [x] Project scaffold (Tauri + Svelte + Rust)
