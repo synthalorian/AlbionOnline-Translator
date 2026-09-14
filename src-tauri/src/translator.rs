@@ -407,10 +407,13 @@ impl TranslationEngine {
         let detected = source_lang.map(|s| s.to_string())
             .or_else(|| self.detect_language(trimmed));
 
-        // Confidence-gated skip — see translate() for rationale.
-        if self.language_confidence(trimmed, target_lang) >= SKIP_TARGET_CONFIDENCE {
-            return None;
-        }
+        // Explicit-translation path — no confidence skip here. translate() gates
+        // on "already in target language" to save network calls on incoming chat;
+        // applying that gate here makes the USER translator silently return the
+        // original text (translate_user_text echoes None as Ok(text)) whenever
+        // lingua thinks the input is already the target (es↔pt confusion, target
+        // == input language). The user asked for a translation — Google sl=auto
+        // resolves identity server-side and caches it. (burned 2026-09-14)
 
         let cache_key = format!(
             "{}:{}:{}",
@@ -459,6 +462,25 @@ impl TranslationEngine {
             }
             Err(e) => {
                 debug!("Google Translate (free) failed: {}", e);
+            }
+        }
+
+        // gtx rate-limits (429) under load; dict-chrome-ex is a separate bucket
+        // with the same JSON shape (burned 2026-09-14: gtx down, dict alive).
+        match self.translate_google_dict(trimmed, target_lang).await {
+            Ok(translated) => {
+                info!(
+                    "Translated via dict {}->{}: {:?} -> {:?}",
+                    detected.as_deref().unwrap_or("auto"),
+                    target_lang,
+                    trimmed,
+                    translated
+                );
+                self.cache_insert(cache_key, translated.clone());
+                return Some(Self::apply_glossary(&translated));
+            }
+            Err(e) => {
+                debug!("Google Translate (dict-chrome-ex) failed: {}", e);
             }
         }
 
@@ -569,6 +591,25 @@ impl TranslationEngine {
             }
         }
 
+        // gtx rate-limits (429) under load; dict-chrome-ex is a separate bucket
+        // with the same JSON shape (burned 2026-09-14: gtx down, dict alive).
+        match self.translate_google_dict(trimmed, &self.target_language).await {
+            Ok(translated) => {
+                info!(
+                    "Translated via dict {}->{}: {:?} -> {:?}",
+                    detected.as_deref().unwrap_or("auto"),
+                    self.target_language,
+                    trimmed,
+                    translated
+                );
+                self.cache_insert(cache_key, translated.clone());
+                return Some(Self::apply_glossary(&translated));
+            }
+            Err(e) => {
+                debug!("Google Translate (dict-chrome-ex) failed: {}", e);
+            }
+        }
+
         // gtx rate-limits (429) under sustained chat load; the mobile web
         // endpoint has a separate bucket and is the next free tier.
         match self.translate_google_mobile(trimmed, &self.target_language).await {
@@ -620,16 +661,42 @@ impl TranslationEngine {
 
     /// Free Google Translate endpoint — no API key required.
     /// Uses the same backend as translate.google.com (client=gtx, sl=auto).
-    /// Response format: [[[sentence_seg, original, null, null, offset], ...], null, "detected_lang", ...]
-    /// Multi-sentence: concatenate ALL segments, not just the first.
     async fn translate_google_free(
         &self,
         text: &str,
         target_lang: &str,
     ) -> anyhow::Result<String> {
+        self.translate_google_client("gtx", text, target_lang).await
+    }
+
+    /// Google's dict-chrome-ex client — the JSON endpoint behind Google
+    /// Translate's Chrome extension. Same [[[seg, orig, null, null, off], ...],
+    /// null, "detected_lang", ...] shape as gtx (so the parser below is shared)
+    /// but a SEPARATE rate-limit bucket. Burned 2026-09-14: gtx 429'd from a
+    /// residential IP for hours while dict-chrome-ex answered 200 with
+    /// identical payloads. Tier 2 between gtx and the /m HTML scrape.
+    async fn translate_google_dict(
+        &self,
+        text: &str,
+        target_lang: &str,
+    ) -> anyhow::Result<String> {
+        self.translate_google_client("dict-chrome-ex", text, target_lang).await
+    }
+
+    /// Shared implementation for the translate.googleapis.com JSON endpoints —
+    /// caller picks the `client` param, which selects its rate-limit bucket.
+    /// Response format: [[[sentence_seg, original, null, null, offset], ...], null, "detected_lang", ...]
+    /// Multi-sentence: concatenate ALL segments, not just the first.
+    async fn translate_google_client(
+        &self,
+        client: &str,
+        text: &str,
+        target_lang: &str,
+    ) -> anyhow::Result<String> {
         let encoded = urlencoding::encode(text);
         let url = format!(
-            "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl={}&dt=t&q={}",
+            "https://translate.googleapis.com/translate_a/single?client={}&sl=auto&tl={}&dt=t&q={}",
+            client,
             target_lang,
             encoded
         );
@@ -891,5 +958,28 @@ mod tests {
         // Romanian is NOT in the detector list — must not be confidently EN.
         let conf = engine.language_confidence("caut grup pentru bătăli de facțiuni diseară", "en");
         assert!(conf < SKIP_TARGET_CONFIDENCE, "Romanian scored EN {}", conf);
+    }
+
+    #[tokio::test]
+    async fn explicit_user_translation_never_skips_confidence_gate() {
+        let mut engine = TranslationEngine::new();
+        // Confident-English text with target=en — the exact case translate()
+        // skips for incoming chat (see clear_english_is_confidently_target).
+        // translate_with_target() must NOT skip: translate_user_text echoes
+        // None as Ok(text), so a skip silently "translates" the user's own
+        // text back to itself (burned 2026-09-14). Result is Some either way —
+        // identity from Google when the network is up, the [lang] fallback
+        // when it's not — never None.
+        let out = engine
+            .translate_with_target("anyone up for a yellow zone fame farm run tonight", None, "en")
+            .await;
+        assert!(out.is_some(), "confident-target text must not be skipped on explicit translate request");
+
+        // es↔pt is lingua's known confusion pair — Spanish text targeting pt
+        // must not be swallowed by a confident-pt gate either.
+        let out2 = engine
+            .translate_with_target("busco grupo para gankear en la zona negra", None, "pt")
+            .await;
+        assert!(out2.is_some(), "es text targeting pt must not be skipped");
     }
 }
