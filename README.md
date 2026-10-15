@@ -1,3 +1,5 @@
+![AlbionOnline-Translator](.github/preview.png)
+
 <p align="center">
   <img src="screenshots/albiontranslatortest.png" alt="Albion Online Translator screenshot" width="720">
 </p>
