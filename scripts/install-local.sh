@@ -20,12 +20,21 @@ if [[ ! -f "$SRC" ]]; then
 fi
 
 mkdir -p "$HOME/.local/bin"
-# cp needs sudo: after the first install the binary is root-owned (required
+# cp needs root: after the first install the binary is root-owned (required
 # for file caps), so a plain user cp can no longer overwrite it.
-sudo cp "$SRC" "$DEST"
-sudo chown root:root "$DEST"
-sudo chmod 755 "$DEST"
-sudo setcap "$CAPS" "$DEST"
+# sudo needs a terminal for its password prompt; launchers and agent shells
+# (Claude Code's `!`) have none, so fall back to pkexec's graphical prompt.
+# All root steps run in ONE elevated shell = one password prompt.
+if [[ -t 0 ]]; then
+  ELEVATE=(sudo)
+else
+  ELEVATE=(pkexec)
+fi
+"${ELEVATE[@]}" /bin/sh -c 'set -e
+  cp "$1" "$2"
+  chown root:root "$2"
+  chmod 755 "$2"
+  setcap "$3" "$2"' sh "$SRC" "$DEST" "$CAPS"
 
 echo "Installed $DEST"
 getcap "$DEST"
@@ -56,7 +65,7 @@ Comment=Real-time Albion Online chat translation overlay
 Exec=$DEST
 Icon=albion-translator
 Terminal=false
-Categories=Game;Utility;
+Categories=Game;
 Keywords=albion;translate;chat;overlay;
 StartupWMClass=albion-translator
 EOF
