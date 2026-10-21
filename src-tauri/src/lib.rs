@@ -135,6 +135,11 @@ async fn set_channel_mapping(
 
 #[tauri::command]
 async fn download_translation_model(lang: String) -> Result<String, String> {
+    // `lang` becomes a path component — refuse anything but a language code
+    // so "../.." can't write outside the model cache.
+    if !(2..=3).contains(&lang.len()) || !lang.bytes().all(|b| b.is_ascii_lowercase()) {
+        return Err(format!("Invalid language code: {}", lang));
+    }
     let model_dir = dirs::cache_dir()
         .ok_or("No cache directory")?
         .join("albion-translator")
@@ -160,9 +165,14 @@ async fn download_translation_model(lang: String) -> Result<String, String> {
         return Err(format!("Download failed: HTTP {}", response.status()));
     }
 
-    std::fs::create_dir_all(&model_path).map_err(|e| e.to_string())?;
+    // Stage into a temp dir and rename at the end: a half-finished download
+    // left `model_path` existing, which the check above then reported as
+    // "already downloaded" forever while CT2 failed to load it.
+    let staging = model_dir.join(format!("{}.partial", model_name));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
     let bytes = response.bytes().await.map_err(|e| e.to_string())?;
-    std::fs::write(model_path.join("model.bin"), &bytes).map_err(|e| e.to_string())?;
+    std::fs::write(staging.join("model.bin"), &bytes).map_err(|e| e.to_string())?;
 
     // Also download the tokenizer/config files
     for file in &["config.json", "shared_vocabulary.txt", "source.spm", "target.spm"] {
@@ -173,11 +183,12 @@ async fn download_translation_model(lang: String) -> Result<String, String> {
         if let Ok(resp) = client.get(&file_url).send().await {
             if resp.status().is_success() {
                 if let Ok(data) = resp.bytes().await {
-                    std::fs::write(model_path.join(file), &data).ok();
+                    std::fs::write(staging.join(file), &data).ok();
                 }
             }
         }
     }
+    std::fs::rename(&staging, &model_path).map_err(|e| e.to_string())?;
 
     Ok(format!("Downloaded {} model — restart app to activate", lang))
 }

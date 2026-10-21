@@ -160,6 +160,16 @@ const MESSAGE_OPERATION_RESPONSE: u8 = 3;
 const MESSAGE_EVENT: u8 = 4;
 const MESSAGE_ENCRYPTED: u8 = 131;
 
+/// Protocol18 values nest (arrays of arrays, dictionaries of hashtables);
+/// real Albion payloads stay in single digits.
+const MAX_NESTING_DEPTH: u32 = 64;
+/// Largest reassembled fragmented message we'll buffer. Albion's biggest
+/// payloads (market/roster dumps) are well under this; anything larger is a
+/// corrupt header, not a message.
+const MAX_FRAGMENT_TOTAL_LEN: usize = 4 * 1024 * 1024;
+/// Fragment sets that lose a packet never complete — cap how many we hold.
+const MAX_PENDING_FRAGMENT_SETS: usize = 32;
+
 /// Photon decoder with Protocol18 deserialization
 #[derive(Clone)]
 pub struct PhotonDecoder {
@@ -263,11 +273,20 @@ impl PhotonDecoder {
         false
     }
 
-    /// Decode a Photon UDP packet
-    /// Returns Some(ChatMessage) if this is a chat message, None otherwise
+    /// Decode a Photon UDP packet and return the FIRST chat message in it.
+    /// Convenience for probes/tests — live capture must use `decode_all`,
+    /// since one datagram can batch several chat commands.
     pub fn decode(&mut self, data: &[u8]) -> Option<ChatMessage> {
+        self.decode_all(data).into_iter().next()
+    }
+
+    /// Decode a Photon UDP packet into every chat message it carries.
+    /// Photon batches multiple commands per datagram under load (busy
+    /// Trade/LFG), so stopping at the first chat event silently dropped the rest.
+    pub fn decode_all(&mut self, data: &[u8]) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
         if data.len() < 12 {
-            return None;
+            return messages;
         }
 
         // Photon header: peer_id (2) + flags (1) + command_count (1) + timestamp (4) + challenge (4)
@@ -276,7 +295,7 @@ impl PhotonDecoder {
 
         // Skip encrypted packets
         if flags == 1 {
-            return None;
+            return messages;
         }
 
         let mut offset = 12;
@@ -321,32 +340,39 @@ impl PhotonDecoder {
                         let start_sequence_number =
                             i32::from_be_bytes(payload[0..4].try_into().unwrap());
                         let total_length =
-                            i32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
+                            i32::from_be_bytes(payload[12..16].try_into().unwrap());
                         let fragment_offset =
-                            i32::from_be_bytes(payload[16..20].try_into().unwrap()) as usize;
+                            i32::from_be_bytes(payload[16..20].try_into().unwrap());
 
-                        match self.fragments.push_fragment(
-                            start_sequence_number,
-                            total_length,
-                            fragment_offset,
-                            &payload[FRAGMENT_HEADER_LEN..],
-                        ) {
-                            Some(complete) => self.decode_message(&complete),
-                            None => None,
+                        // Negative wire values would sign-extend into
+                        // exabyte-sized allocations — reject them outright.
+                        match (usize::try_from(total_length), usize::try_from(fragment_offset)) {
+                            (Ok(total_length), Ok(fragment_offset)) => {
+                                match self.fragments.push_fragment(
+                                    start_sequence_number,
+                                    total_length,
+                                    fragment_offset,
+                                    &payload[FRAGMENT_HEADER_LEN..],
+                                ) {
+                                    Some(complete) => self.decode_message(&complete),
+                                    None => None,
+                                }
+                            }
+                            _ => None,
                         }
                     }
                 }
                 _ => None,
             };
 
-            if message.is_some() {
-                return message;
+            if let Some(message) = message {
+                messages.push(message);
             }
 
             offset = next_offset;
         }
 
-        None
+        messages
     }
 
     fn decode_message(&mut self, data: &[u8]) -> Option<ChatMessage> {
@@ -742,7 +768,20 @@ impl PhotonDecoder {
         Some(params)
     }
 
+    /// Depth-guarded entry point: nested arrays/dictionaries recurse, and a
+    /// crafted or corrupt packet (or a reassembled multi-KB fragment) of
+    /// back-to-back 0x40 array-in-array codes would otherwise blow the stack.
     fn deserialize(&self, reader: &mut Reader, type_code: Option<u8>) -> Option<serde_json::Value> {
+        if reader.depth >= MAX_NESTING_DEPTH {
+            return None;
+        }
+        reader.depth += 1;
+        let value = self.deserialize_value(reader, type_code);
+        reader.depth -= 1;
+        value
+    }
+
+    fn deserialize_value(&self, reader: &mut Reader, type_code: Option<u8>) -> Option<serde_json::Value> {
         let type_code = match type_code {
             Some(value) => value,
             None => reader.read_u8()?,
@@ -776,17 +815,17 @@ impl PhotonDecoder {
             23 => self.deserialize_object_array(reader),
             24 => {
                 let payload = reader.read_bytes(reader.remaining())?;
-                let (code, params) = self.deserialize_operation_request(payload)?;
+                let (code, params) = self.deserialize_operation_request(payload, reader.depth)?;
                 Some(serde_json::json!([code, params]))
             }
             25 => {
                 let payload = reader.read_bytes(reader.remaining())?;
-                let (code, rc, msg, params) = self.deserialize_operation_response(payload)?;
+                let (code, rc, msg, params) = self.deserialize_operation_response(payload, reader.depth)?;
                 Some(serde_json::json!([code, rc, msg, params]))
             }
             26 => {
                 let payload = reader.read_bytes(reader.remaining())?;
-                let (code, params) = self.deserialize_event_data(payload)?;
+                let (code, params) = self.deserialize_event_data(payload, reader.depth)?;
                 Some(serde_json::json!([code, params]))
             }
             27 => Some(serde_json::Value::Bool(false)),
@@ -825,8 +864,9 @@ impl PhotonDecoder {
     fn deserialize_operation_request(
         &self,
         payload: &[u8],
+        depth: u32,
     ) -> Option<(u8, serde_json::Value)> {
-        let mut reader = Reader::new(payload);
+        let mut reader = Reader::nested(payload, depth);
         let operation_code = reader.read_u8()?;
         Some((
             operation_code,
@@ -837,8 +877,9 @@ impl PhotonDecoder {
     fn deserialize_operation_response(
         &self,
         payload: &[u8],
+        depth: u32,
     ) -> Option<(u8, i16, String, serde_json::Value)> {
-        let mut reader = Reader::new(payload);
+        let mut reader = Reader::nested(payload, depth);
         let operation_code = reader.read_u8()?;
         let return_code = reader.read_i16_le()?;
         let mut debug_message = String::new();
@@ -857,8 +898,8 @@ impl PhotonDecoder {
         ))
     }
 
-    fn deserialize_event_data(&self, payload: &[u8]) -> Option<(u8, serde_json::Value)> {
-        let mut reader = Reader::new(payload);
+    fn deserialize_event_data(&self, payload: &[u8], depth: u32) -> Option<(u8, serde_json::Value)> {
+        let mut reader = Reader::nested(payload, depth);
         let event_code = reader.read_u8()?;
         Some((
             event_code,
@@ -938,7 +979,9 @@ impl PhotonDecoder {
 
     fn deserialize_boolean_array(&self, reader: &mut Reader) -> Option<serde_json::Value> {
         let len = self.read_count(reader)?;
-        let mut result = Vec::with_capacity(len);
+        // Wire-supplied count: cap the up-front allocation by what the
+        // buffer can actually hold (8 bools per byte).
+        let mut result = Vec::with_capacity(len.min(reader.remaining().saturating_mul(8)));
         while result.len() < len {
             let value = reader.read_u8()?;
             for bit_index in 0..8 {
@@ -954,7 +997,7 @@ impl PhotonDecoder {
     fn deserialize_custom_type_array(&self, reader: &mut Reader) -> Option<serde_json::Value> {
         let len = self.read_count(reader)?;
         let type_code = reader.read_u8()?;
-        let mut values = Vec::with_capacity(len);
+        let mut values = Vec::with_capacity(len.min(reader.remaining()));
         for _ in 0..len {
             values.push(self.deserialize_custom_payload(reader, type_code)?);
         }
@@ -1042,7 +1085,10 @@ impl PhotonDecoder {
         F: FnMut(&mut Reader) -> Option<serde_json::Value>,
     {
         let len = self.read_count(reader)?;
-        let mut values = Vec::with_capacity(len);
+        // Wire-supplied count (up to u32::MAX): every element is at least one
+        // byte, so never reserve more than the buffer can hold — a corrupt
+        // count otherwise aborts the process on allocation failure.
+        let mut values = Vec::with_capacity(len.min(reader.remaining()));
         for _ in 0..len {
             values.push(f(reader)?);
         }
@@ -1134,6 +1180,11 @@ struct PendingSegment {
     payload: Vec<u8>,
     written: usize,
     total_length: usize,
+    /// Offsets already copied in. Reliable fragments get RETRANSMITTED when
+    /// an ack is lost; counting a retransmit twice "completed" the message
+    /// early with a zero-filled hole in it.
+    received_offsets: std::collections::HashSet<usize>,
+    created: std::time::Instant,
 }
 
 impl FragmentReassembler {
@@ -1149,8 +1200,27 @@ impl FragmentReassembler {
         fragment_offset: usize,
         fragment: &[u8],
     ) -> Option<Vec<u8>> {
-        if fragment_offset + fragment.len() > total_length {
+        if total_length == 0 || total_length > MAX_FRAGMENT_TOTAL_LEN {
             return None;
+        }
+        match fragment_offset.checked_add(fragment.len()) {
+            Some(end) if end <= total_length => {}
+            _ => return None,
+        }
+
+        // A set that lost a fragment never completes; evict the oldest
+        // instead of growing without bound over a long session.
+        if !self.pending_segments.contains_key(&start_sequence_number)
+            && self.pending_segments.len() >= MAX_PENDING_FRAGMENT_SETS
+        {
+            if let Some(oldest) = self
+                .pending_segments
+                .iter()
+                .min_by_key(|(_, seg)| seg.created)
+                .map(|(seq, _)| *seq)
+            {
+                self.pending_segments.remove(&oldest);
+            }
         }
 
         let pending = self
@@ -1160,10 +1230,16 @@ impl FragmentReassembler {
                 payload: vec![0; total_length],
                 written: 0,
                 total_length,
+                received_offsets: std::collections::HashSet::new(),
+                created: std::time::Instant::now(),
             });
 
         if pending.total_length != total_length {
             return None;
+        }
+
+        if !pending.received_offsets.insert(fragment_offset) {
+            return None; // retransmitted duplicate
         }
 
         pending.payload[fragment_offset..fragment_offset + fragment.len()]
@@ -1189,11 +1265,19 @@ impl FragmentReassembler {
 struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
+    /// Current deserialize() nesting depth (see MAX_NESTING_DEPTH).
+    depth: u32,
 }
 
 impl<'a> Reader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, pos: 0 }
+        Self::nested(data, 0)
+    }
+
+    /// Reader over an embedded payload that inherits the parent's depth, so
+    /// nested operation/event payloads can't reset the recursion guard.
+    fn nested(data: &'a [u8], depth: u32) -> Self {
+        Self { data, pos: 0, depth }
     }
 
     fn remaining(&self) -> usize {
@@ -1263,6 +1347,65 @@ mod tests {
     fn rejects_out_of_bounds_fragments() {
         let mut reassembler = FragmentReassembler::new();
         assert!(reassembler.push_fragment(1, 10, 8, &[1u8; 4]).is_none());
+        // Oversized / overflowing headers must be refused, not allocated.
+        assert!(reassembler.push_fragment(2, usize::MAX, 0, &[1u8; 4]).is_none());
+        assert!(reassembler.push_fragment(3, 16, usize::MAX, &[1u8; 4]).is_none());
+        assert!(reassembler.push_fragment(4, MAX_FRAGMENT_TOTAL_LEN + 1, 0, &[1u8; 4]).is_none());
+    }
+
+    #[test]
+    fn retransmitted_fragment_does_not_complete_early() {
+        let mut reassembler = FragmentReassembler::new();
+        assert!(reassembler.push_fragment(7, 16, 0, &[1u8; 8]).is_none());
+        // Same fragment again (lost ack → retransmit) must not count twice.
+        assert!(reassembler.push_fragment(7, 16, 0, &[1u8; 8]).is_none());
+        let complete = reassembler.push_fragment(7, 16, 8, &[2u8; 8]).expect("complete");
+        assert_eq!(&complete[8..16], &[2u8; 8]);
+    }
+
+    #[test]
+    fn stale_fragment_sets_are_evicted() {
+        let mut reassembler = FragmentReassembler::new();
+        for seq in 0..(MAX_PENDING_FRAGMENT_SETS as i32 * 4) {
+            reassembler.push_fragment(seq, 16, 0, &[0u8; 8]);
+        }
+        assert!(reassembler.pending_segments.len() <= MAX_PENDING_FRAGMENT_SETS);
+    }
+
+    #[test]
+    fn huge_wire_counts_do_not_abort() {
+        // String array (71) claiming u32::MAX elements in a 6-byte buffer.
+        let decoder = PhotonDecoder::new();
+        let data = [0xff, 0xff, 0xff, 0xff, 0x0f, 0x00];
+        let mut reader = Reader::new(&data);
+        assert!(decoder.deserialize(&mut reader, Some(71)).is_none());
+    }
+
+    #[test]
+    fn deeply_nested_arrays_are_rejected_not_stack_overflowed() {
+        // Object array (23) of length 1 whose element is another object
+        // array, repeated far past MAX_NESTING_DEPTH.
+        let decoder = PhotonDecoder::new();
+        let data: Vec<u8> = std::iter::repeat_n([0x01u8, 23u8], 100_000).flatten().collect();
+        let mut reader = Reader::new(&data);
+        assert!(decoder.deserialize(&mut reader, Some(23)).is_none());
+    }
+
+    #[test]
+    fn decodes_every_chat_message_in_a_batched_datagram() {
+        // Two SendUnreliable chat commands in one UDP datagram.
+        let say_a = [0x02, 0x00, 0x07, 0x01, b'A', 0x01, 0x07, 0x02, b'h', b'i'];
+        let say_b = [0x02, 0x00, 0x07, 0x01, b'B', 0x01, 0x07, 0x02, b'y', b'o'];
+        let pkt_a = build_chat_packet(74, &say_a);
+        let pkt_b = build_chat_packet(74, &say_b);
+        let mut pkt = pkt_a.clone();
+        pkt[3] = 2; // command_count
+        pkt.extend_from_slice(&pkt_b[12..]); // append B's command
+        let mut decoder = PhotonDecoder::new();
+        let msgs = decoder.decode_all(&pkt);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].sender, "A");
+        assert_eq!(msgs[1].sender, "B");
     }
 
     /// Build a Photon packet with a single SendUnreliable (type 7) command carrying

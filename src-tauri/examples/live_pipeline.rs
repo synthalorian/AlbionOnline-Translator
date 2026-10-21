@@ -11,7 +11,10 @@ async fn main() {
         .init();
 
     let (tx, mut rx) = mpsc::channel::<photon::ChatMessage>(100);
-    let mut sniffer = PacketSniffer::new(tx);
+    let translator = std::sync::Arc::new(tokio::sync::Mutex::new(
+        albion_translator_lib::translator::TranslationEngine::new(),
+    ));
+    let mut sniffer = PacketSniffer::new(tx, translator);
     sniffer.start(None).expect("capture start");
 
     // Heartbeat: proves whether OTHER tasks get scheduled while the blocking

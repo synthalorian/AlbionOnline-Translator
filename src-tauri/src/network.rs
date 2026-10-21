@@ -32,6 +32,7 @@ fn parse_ethernet_header(data: &[u8]) -> Option<EthernetHeader> {
 
 const IPV4_TYPE: u16 = 0x0800;
 const IPV6_TYPE: u16 = 0x86DD;
+const VLAN_TYPE: u16 = 0x8100;
 
 // ── IPv4 ────────────────────────────────────────────────────────────────────
 
@@ -41,6 +42,11 @@ struct Ipv4Header {
     dst_ip: Ipv4Addr,
     protocol: u8,
     header_len: usize,
+    /// IP total length — bytes past this are link-layer padding.
+    total_len: usize,
+    /// Non-zero for the 2nd+ fragment of a fragmented datagram, which has no
+    /// UDP header (its first bytes are mid-payload data).
+    fragment_offset: u16,
 }
 
 fn parse_ipv4_header(data: &[u8]) -> Option<Ipv4Header> {
@@ -60,6 +66,7 @@ fn parse_ipv4_header(data: &[u8]) -> Option<Ipv4Header> {
     if total_length < ihl || total_length > data.len() {
         return None;
     }
+    let fragment_offset = u16::from_be_bytes([data[6], data[7]]) & 0x1FFF;
     let protocol = data[9];
     let src_ip = Ipv4Addr::from(u32::from_be_bytes([data[12], data[13], data[14], data[15]]));
     let dst_ip = Ipv4Addr::from(u32::from_be_bytes([data[16], data[17], data[18], data[19]]));
@@ -68,6 +75,8 @@ fn parse_ipv4_header(data: &[u8]) -> Option<Ipv4Header> {
         dst_ip,
         protocol,
         header_len: ihl,
+        total_len: total_length,
+        fragment_offset,
     })
 }
 
@@ -78,6 +87,7 @@ struct Ipv6Header {
     src_ip: Ipv6Addr,
     dst_ip: Ipv6Addr,
     next_header: u8,
+    payload_len: usize,
 }
 
 fn parse_ipv6_header(data: &[u8]) -> Option<Ipv6Header> {
@@ -88,7 +98,7 @@ fn parse_ipv6_header(data: &[u8]) -> Option<Ipv6Header> {
     if version != 6 {
         return None;
     }
-    let _payload_len = u16::from_be_bytes([data[4], data[5]]);
+    let payload_len = u16::from_be_bytes([data[4], data[5]]) as usize;
     let next_header = data[6];
     let src_ip = Ipv6Addr::from([
         u16::from_be_bytes([data[8], data[9]]),
@@ -114,6 +124,7 @@ fn parse_ipv6_header(data: &[u8]) -> Option<Ipv6Header> {
         src_ip,
         dst_ip,
         next_header,
+        payload_len,
     })
 }
 
@@ -122,9 +133,12 @@ fn parse_ipv6_header(data: &[u8]) -> Option<Ipv6Header> {
 /// Extract UDP payload from an IPv4 packet. Returns (src_ip, dst_ip, payload).
 fn extract_udp_payload_ipv4(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     let ip = parse_ipv4_header(data)?;
-    if ip.protocol != 17 {
+    if ip.protocol != 17 || ip.fragment_offset != 0 {
         return None;
     }
+    // Ethernet pads short frames to 60 bytes; slicing to the end of the
+    // frame instead of the IP total length fed that padding to the decoder.
+    let data = &data[..ip.total_len];
     let ip_end = ip.header_len;
     if ip_end + UDP_HEADER_LEN > data.len() {
         return None;
@@ -143,6 +157,7 @@ fn extract_udp_payload_ipv6(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     if ip.next_header != 17 {
         return None;
     }
+    let data = &data[..(IPV6_HEADER_LEN + ip.payload_len).min(data.len())];
     let udp_start = IPV6_HEADER_LEN;
     if udp_start + UDP_HEADER_LEN > data.len() {
         return None;
@@ -174,9 +189,18 @@ pub fn extract_udp_packet(data: &[u8]) -> Option<(IpAddr, IpAddr, u16, u16, &[u8
 /// Tries IPv4 first, then IPv6. Returns None if the frame isn't IP/UDP.
 pub fn extract_udp_payload(data: &[u8]) -> Option<(IpAddr, IpAddr, &[u8])> {
     let eth = parse_ethernet_header(data)?;
-    match eth.ether_type {
-        h if h == IPV4_TYPE => extract_udp_payload_ipv4(&data[ETHERNET_HEADER_LEN..]),
-        h if h == IPV6_TYPE => extract_udp_payload_ipv6(&data[ETHERNET_HEADER_LEN..]),
+    let (ether_type, ip_start) = if eth.ether_type == VLAN_TYPE {
+        // 802.1Q tag: 4 extra bytes, real ethertype in the last two.
+        if data.len() < ETHERNET_HEADER_LEN + 4 {
+            return None;
+        }
+        (u16::from_be_bytes([data[16], data[17]]), ETHERNET_HEADER_LEN + 4)
+    } else {
+        (eth.ether_type, ETHERNET_HEADER_LEN)
+    };
+    match ether_type {
+        IPV4_TYPE => extract_udp_payload_ipv4(&data[ip_start..]),
+        IPV6_TYPE => extract_udp_payload_ipv6(&data[ip_start..]),
         _ => None,
     }
 }
@@ -314,6 +338,22 @@ mod tests {
         assert_eq!(extracted, payload.as_slice());
         assert_eq!(extracted[3], 0x03, "command_count must be at byte 3");
         assert_eq!(&extracted[28..30], &[0xf3, 0x04], "message must start at byte 28");
+    }
+
+    #[test]
+    fn ethernet_padding_is_not_part_of_the_payload() {
+        let payload = [0xAAu8; 4];
+        let mut frame = wrap_udp_frame(&payload);
+        frame.resize(60, 0); // minimum Ethernet frame, zero-padded
+        let (_, _, extracted) = extract_udp_payload(&frame).expect("extract");
+        assert_eq!(extracted, &payload);
+    }
+
+    #[test]
+    fn non_first_ip_fragments_are_skipped() {
+        let mut frame = wrap_udp_frame(&[1, 2, 3, 4]);
+        frame[20..22].copy_from_slice(&[0x00, 0xb9]); // fragment offset 185
+        assert!(extract_udp_payload(&frame).is_none());
     }
 
     #[test]

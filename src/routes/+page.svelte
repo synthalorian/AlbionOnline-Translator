@@ -6,10 +6,14 @@
   import { loadSettings, saveSettings, applySettings } from "$lib/settings.js";
   import { languages } from "$lib/languages.js";
 
-  let settings = $state(loadSettings());
+  // Click-through is never restored at launch: the backend starts with a
+  // normal window, so a persisted `true` only showed a checked box that did
+  // nothing (and re-toggling it inverted the meaning).
+  let settings = $state({ ...loadSettings(), clickThrough: false });
   let isCapturing = $state(false);
   let captureDevice = $state("");
   let packetCount = $state(0);
+  /** @type {ReturnType<typeof setInterval> | null} */
   let statsTimer = null;
 
   /** @typedef {{ timestamp: string, channel: string, channel_id: number, sender: string, text: string, source_lang?: string, translated_text?: string }} ChatMessage */
@@ -43,7 +47,7 @@
     if (chatContainer && !scrollFrozen) {
       // Use requestAnimationFrame to wait for DOM update
       requestAnimationFrame(() => {
-        chatContainer.scrollTop = chatContainer.scrollHeight;
+        if (chatContainer) chatContainer.scrollTop = chatContainer.scrollHeight;
       });
     }
   });
@@ -123,14 +127,18 @@
 
     try {
       isCapturing = await invoke("get_capture_status");
-      settings.targetLanguage = await invoke("get_target_language");
+      // The backend always boots with "en" — push the SAVED choice to it
+      // instead of overwriting the saved choice with the backend default.
+      await invoke("set_target_language", { lang: settings.targetLanguage || "en" });
     } catch (e) {
       console.error("Failed to load state:", e);
     }
 
     unlisten = await listen("chat-message", (event) => {
       const msg = event.payload;
-      messages = [...messages.slice(-settings.maxMessages + 1), msg];
+      // slice(-0) is the WHOLE array, so clamp to keep the buffer bounded.
+      const keep = Math.max(1, Number(settings.maxMessages) || 100) - 1;
+      messages = keep > 0 ? [...messages.slice(-keep), msg] : [msg];
     });
   });
 
@@ -191,7 +199,7 @@
             if (!running) {
               isCapturing = false;
               captureDevice = "";
-              clearInterval(statsTimer);
+              if (statsTimer) clearInterval(statsTimer);
               statsTimer = null;
             }
           } catch { /* transient — next tick retries */ }
@@ -339,14 +347,14 @@
   async function runDiagnostic() {
     diagRunning = true;
     diagResult = "";
+    // Stop capture so the diagnostic can open the device.
+    const wasCapturing = isCapturing;
     try {
-      // Stop capture so the diagnostic can open the device.
-      const wasCapturing = isCapturing;
       if (wasCapturing) await toggleCapture();
       const r = await invoke("run_network_diagnostic", {
         device: settings.captureInterface || null,
       });
-      const ports = r.top_udp_ports.map(([p, n]) => `${p}×${n}`).join(", ");
+      const ports = r.top_udp_ports.map((/** @type {[number, number]} */ [p, n]) => `${p}×${n}`).join(", ");
       let verdict;
       if (r.total_packets === 0) {
         verdict = "❌ No packets at all — capture driver (Npcap) or adapter is broken.";
@@ -366,10 +374,11 @@
         `${r.albion_packets} Albion-port (in ${r.albion_inbound} / out ${r.albion_outbound})\n` +
         `Photon: ${r.albion_encrypted} encrypted, ${r.photon_chat_decoded} chat decoded\n` +
         `Top UDP ports: ${ports || "none"}\n${verdict}`;
-      if (wasCapturing) await toggleCapture();
     } catch (e) {
       diagResult = "Diagnostic failed: " + e;
     } finally {
+      // Restart even when the survey failed — it used to leave capture off.
+      if (wasCapturing && !isCapturing) await toggleCapture();
       diagRunning = false;
     }
   }

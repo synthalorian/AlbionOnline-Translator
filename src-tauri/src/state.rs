@@ -13,9 +13,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(tx: mpsc::Sender<ChatMessage>) -> Self {
+        let translator = Arc::new(Mutex::new(TranslationEngine::new()));
         Self {
-            sniffer: Arc::new(Mutex::new(PacketSniffer::new(tx))),
-            translator: Arc::new(Mutex::new(TranslationEngine::new())),
+            sniffer: Arc::new(Mutex::new(PacketSniffer::new(tx, translator.clone()))),
+            translator,
         }
     }
 }

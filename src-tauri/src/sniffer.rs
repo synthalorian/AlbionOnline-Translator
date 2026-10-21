@@ -262,8 +262,8 @@ pub fn run_diagnostic(
                         // Mirror PhotonDecoder::decode's encryption skip.
                         if payload.len() >= 12 && payload[2] == 1 {
                             encrypted += 1;
-                        } else if decoder.decode(payload).is_some() {
-                            chat_decoded += 1;
+                        } else {
+                            chat_decoded += decoder.decode_all(payload).len() as u64;
                         }
                     }
                     // The lower port is usually the service port (53/443/2408…).
@@ -375,9 +375,19 @@ pub fn list_devices() -> Vec<String> {
 }
 
 pub struct PacketSniffer {
+    /// Per-session run flag. A FRESH Arc per start(): the previous session's
+    /// capture thread can sit in next_packet() for up to its 1s timeout after
+    /// stop(), and with one shared flag a quick stop→start (interface switch,
+    /// diagnostic) flipped it back to true — the old loop kept running and
+    /// every message arrived twice.
     running: Arc<AtomicBool>,
     packets: Arc<AtomicU64>,
     tx: mpsc::Sender<photon::ChatMessage>,
+    /// The app-wide engine, shared with the Tauri commands so the target
+    /// language the user picks actually applies to incoming chat (the worker
+    /// used to build its own engine, hard-wired to English, and loaded every
+    /// CT2 model a second time).
+    translator: Arc<tokio::sync::Mutex<TranslationEngine>>,
     host_filter: Option<HostFilter>,
     /// Shared channel map — the decoder reads/writes through this, and the
     /// Tauri command handler can inject manual mappings from the UI.
@@ -385,7 +395,10 @@ pub struct PacketSniffer {
 }
 
 impl PacketSniffer {
-    pub fn new(tx: mpsc::Sender<photon::ChatMessage>) -> Self {
+    pub fn new(
+        tx: mpsc::Sender<photon::ChatMessage>,
+        translator: Arc<tokio::sync::Mutex<TranslationEngine>>,
+    ) -> Self {
         // Try to load hosts.txt from the current working directory; if it
         // doesn't exist or is empty, run unfiltered (backward compat).
         let host_filter = if std::path::Path::new(DEFAULT_HOSTS_PATH).exists() {
@@ -404,6 +417,7 @@ impl PacketSniffer {
             running: Arc::new(AtomicBool::new(false)),
             packets: Arc::new(AtomicU64::new(0)),
             tx,
+            translator,
             host_filter,
             channel_map: Arc::new(StdMutex::new(saved)),
         }
@@ -470,11 +484,12 @@ impl PacketSniffer {
         cap.filter(BPF_FILTER, true)
             .map_err(|e| SnifferError::Filter(e.to_string()))?;
 
-        self.running.store(true, Ordering::SeqCst);
-        self.packets.store(0, Ordering::SeqCst);
+        self.running = Arc::new(AtomicBool::new(true));
+        self.packets = Arc::new(AtomicU64::new(0));
         let running = self.running.clone();
         let packets = self.packets.clone();
         let tx = self.tx.clone();
+        let translator = self.translator.clone();
         let host_filter = self.host_filter.clone();
         let channel_map = self.channel_map.clone();
 
@@ -484,12 +499,15 @@ impl PacketSniffer {
         let (raw_tx, mut raw_rx) = mpsc::channel::<photon::ChatMessage>(64);
 
         tokio::spawn(async move {
-            debug!("translation worker: spawned");
-            let mut translator = TranslationEngine::new();
-            debug!("translation worker: engine ready, entering recv loop");
+            debug!("translation worker: spawned, entering recv loop");
             while let Some(msg) = raw_rx.recv().await {
                 debug!("translation worker: received msg from {}", msg.sender);
-                let ui_msg = Self::convert_message(&msg, &mut translator).await;
+                // Lock per message, not per session, so the user translator
+                // waits for at most one in-flight chat translation.
+                let ui_msg = {
+                    let mut engine = translator.lock().await;
+                    Self::convert_message(&msg, &mut engine).await
+                };
                 if tx.send(ui_msg).await.is_err() {
                     break;
                 }
@@ -535,13 +553,12 @@ impl PacketSniffer {
                                 }
                             }
 
-                            if let Some(msg) = decoder.decode(payload) {
-                                // blocking_send waits for capacity — natural
-                                // backpressure straight to the capture loop.
-                                if raw_tx.blocking_send(msg).is_err() {
-                                    error!("Failed to send chat message");
-                                    break;
-                                }
+                            // blocking_send waits for capacity — natural
+                            // backpressure straight to the capture loop.
+                            let msgs = decoder.decode_all(payload);
+                            if msgs.into_iter().any(|msg| raw_tx.blocking_send(msg).is_err()) {
+                                error!("Failed to send chat message");
+                                break;
                             }
                         } else {
                             // Packet passed the port filter but isn't extractable
@@ -549,13 +566,19 @@ impl PacketSniffer {
                             filtered_count += 1;
                         }
                     }
+                    Err(pcap::Error::TimeoutExpired) => continue,
                     Err(e) => {
-                        if running.load(Ordering::SeqCst) {
-                            debug!("Capture timeout: {}", e);
-                        }
+                        // Adapter unplugged / interface went down. These
+                        // errors repeat instantly, so retrying here pinned a
+                        // core at 100% while the UI still claimed CAPTURING.
+                        error!("Capture error, stopping: {}", e);
+                        break;
                     }
                 }
             }
+            // Whatever ended the loop, report not-running so the UI's stats
+            // poll flips to IDLE and a restart isn't refused as AlreadyRunning.
+            running.store(false, Ordering::SeqCst);
 
             info!(
                 "Packet capture stopped. Total: {}, Filtered (non-IP): {}, IP-filtered: {}",

@@ -1,12 +1,20 @@
 <script>
   import { onMount } from "svelte";
-  import { loadSettings, saveSettings } from "$lib/settings.js";
+  import { loadSettings } from "$lib/settings.js";
   import { applyTheme, getStoredTheme } from "$lib/themes.js";
   import { languages } from "$lib/languages.js";
 
   // Defaults come from the shared settings store (same origin, same localStorage)
+  // The user translator's language lives under its OWN key: the parent
+  // page saves its whole (stale) settings object on every change, which
+  // overwrote userTargetLanguage and reset the picker on the next launch.
+  const USER_LANG_KEY = "albion-translator-user-lang";
   const stored = loadSettings();
-  let targetLang = $state(stored.userTargetLanguage || "es");
+  let initialLang = stored.userTargetLanguage || "es";
+  try {
+    initialLang = localStorage.getItem(USER_LANG_KEY) || initialLang;
+  } catch {}
+  let targetLang = $state(initialLang);
   let inputText = $state("");
   let result = $state("");
   let translating = $state(false);
@@ -85,8 +93,10 @@
   }
 
   function changeLang() {
-    // Keep the shared settings store in sync so the picker survives reloads
-    saveSettings({ ...loadSettings(), userTargetLanguage: targetLang });
+    // Own key so the parent's saveSettings can't clobber it (see USER_LANG_KEY)
+    try {
+      localStorage.setItem(USER_LANG_KEY, targetLang);
+    } catch {}
     // User translator language is independent — don't sync to parent
   }
 
@@ -106,9 +116,13 @@
       "*"
     );
 
+    /** @type {ReturnType<typeof setTimeout> | undefined} */
+    let timer;
+
     /** @param {MessageEvent} event */
     const handler = (event) => {
       if (event.data?.type === "albion-translate-result" && event.data.id === requestId) {
+        clearTimeout(timer);
         window.removeEventListener("message", handler);
         if (event.data.error) {
           error = event.data.error;
@@ -120,8 +134,10 @@
     };
     window.addEventListener("message", handler);
 
-    // Timeout fallback so the button never spins forever
-    setTimeout(() => {
+    // Timeout fallback so the button never spins forever. Cleared on reply:
+    // a stale timer from an EARLIER request used to fire mid-way through the
+    // next one and report a bogus timeout.
+    timer = setTimeout(() => {
       window.removeEventListener("message", handler);
       if (translating) {
         error = "Translation timed out — check your connection";

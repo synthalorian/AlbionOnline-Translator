@@ -258,6 +258,8 @@ impl TranslationEngine {
     }
 
     /// Look up a translation in the cache (memory first, then SQLite).
+    /// Returns the RAW translation — callers apply the glossary, so both
+    /// tiers behave the same (the memory tier used to skip it).
     fn cache_get(&self, key: &str) -> Option<String> {
         // Hot path: in-memory
         if let Some(cached) = self.cache.get(key) {
@@ -272,7 +274,7 @@ impl TranslationEngine {
                     |row| row.get(0),
                 );
                 if let Ok(translated) = result {
-                    return Some(Self::apply_glossary(&translated));
+                    return Some(translated);
                 }
             }
         }
@@ -367,22 +369,39 @@ impl TranslationEngine {
     /// Apply the Albion glossary to translated text — ensures game terms
     /// are consistent in English output (e.g. "hiding place" → "hideout",
     /// "looking for group" stays as "LFG").
-    fn apply_glossary(text: &str) -> String {
+    /// The glossary maps to ENGLISH game terms, so it only runs when the
+    /// target is English — otherwise it injected English words ("guild")
+    /// into e.g. Spanish output.
+    fn apply_glossary(text: &str, target_lang: &str) -> String {
+        if target_lang != "en" {
+            return text.to_string();
+        }
         let mut result = text.to_string();
         for (term, replacement) in GLOSSARY {
-            // Case-insensitive whole-word replacement
-            let lower = result.to_lowercase();
-            let term_lower = term.to_lowercase();
-            if let Some(pos) = lower.find(&term_lower) {
-                let before = &lower[..pos];
-                let after = &lower[pos + term_lower.len()..];
-                // Only replace if it's a whole word (not part of another word)
-                let word_before = before.chars().last().map(|c| !c.is_alphanumeric()).unwrap_or(true);
-                let word_after = after.chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+            // Case-insensitive whole-word replacement of EVERY occurrence.
+            // ASCII lowercasing keeps byte offsets identical to `result`;
+            // to_lowercase() changes lengths for chars like 'İ', which made
+            // the old slicing panic (killing the translation worker) or
+            // splice at the wrong place.
+            let lower = result.to_ascii_lowercase();
+            let term_lower = term.to_ascii_lowercase();
+            let mut out = String::with_capacity(result.len());
+            let mut last = 0;
+            for (pos, _) in lower.match_indices(&term_lower) {
+                if pos < last {
+                    continue;
+                }
+                let end = pos + term_lower.len();
+                let word_before = lower[..pos].chars().last().map(|c| !c.is_alphanumeric()).unwrap_or(true);
+                let word_after = lower[end..].chars().next().map(|c| !c.is_alphanumeric()).unwrap_or(true);
                 if word_before && word_after {
-                    result = format!("{}{}{}", &result[..pos], replacement, &result[pos + term.len()..]);
+                    out.push_str(&result[last..pos]);
+                    out.push_str(replacement);
+                    last = end;
                 }
             }
+            out.push_str(&result[last..]);
+            result = out;
         }
         result
     }
@@ -424,7 +443,7 @@ impl TranslationEngine {
 
         if let Some(cached) = self.cache_get(&cache_key) {
             debug!("Cache hit for: {}", trimmed);
-            return Some(cached.clone());
+            return Some(Self::apply_glossary(&cached, target_lang));
         }
 
         // Try CTranslate2 if we have a model for the detected source language
@@ -436,7 +455,7 @@ impl TranslationEngine {
                         match self.translate_ct2(translator, trimmed, Some(det)).await {
                             Ok(translated) => {
                                 self.cache_insert(cache_key, translated.clone());
-                                return Some(Self::apply_glossary(&translated));
+                                return Some(Self::apply_glossary(&translated, target_lang));
                             }
                             Err(e) => {
                                 debug!("CTranslate2 failed: {}", e);
@@ -458,7 +477,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(Self::apply_glossary(&translated));
+                return Some(Self::apply_glossary(&translated, target_lang));
             }
             Err(e) => {
                 debug!("Google Translate (free) failed: {}", e);
@@ -477,7 +496,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(Self::apply_glossary(&translated));
+                return Some(Self::apply_glossary(&translated, target_lang));
             }
             Err(e) => {
                 debug!("Google Translate (dict-chrome-ex) failed: {}", e);
@@ -496,7 +515,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(Self::apply_glossary(&translated));
+                return Some(Self::apply_glossary(&translated, target_lang));
             }
             Err(e) => {
                 debug!("Google Translate (/m) failed: {}", e);
@@ -551,7 +570,7 @@ impl TranslationEngine {
 
         if let Some(cached) = self.cache_get(&cache_key) {
             debug!("Cache hit for: {}", trimmed);
-            return Some(cached.clone());
+            return Some(Self::apply_glossary(&cached, &self.target_language));
         }
 
         // Try CTranslate2 if we have a model for the detected source language —
@@ -563,7 +582,7 @@ impl TranslationEngine {
                     match self.translate_ct2(translator, trimmed, Some(det)).await {
                         Ok(translated) => {
                             self.cache_insert(cache_key, translated.clone());
-                            return Some(Self::apply_glossary(&translated));
+                            return Some(Self::apply_glossary(&translated, &self.target_language));
                         }
                         Err(e) => {
                             debug!("CTranslate2 failed: {}", e);
@@ -584,7 +603,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(Self::apply_glossary(&translated));
+                return Some(Self::apply_glossary(&translated, &self.target_language));
             }
             Err(e) => {
                 debug!("Google Translate (free) failed: {}", e);
@@ -603,7 +622,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(Self::apply_glossary(&translated));
+                return Some(Self::apply_glossary(&translated, &self.target_language));
             }
             Err(e) => {
                 debug!("Google Translate (dict-chrome-ex) failed: {}", e);
@@ -622,7 +641,7 @@ impl TranslationEngine {
                     translated
                 );
                 self.cache_insert(cache_key, translated.clone());
-                return Some(Self::apply_glossary(&translated));
+                return Some(Self::apply_glossary(&translated, &self.target_language));
             }
             Err(e) => {
                 debug!("Google Translate (/m) failed: {}", e);
@@ -872,6 +891,20 @@ impl TranslationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn glossary_survives_non_ascii_and_replaces_every_occurrence() {
+        // 'İ' lowercases to 2 chars (3 bytes) — used to shift offsets and panic.
+        let out = TranslationEngine::apply_glossary("İstanbul WTS T8, WTS more", "en");
+        assert_eq!(out, "İstanbul want to sell tier 8, want to sell more");
+        // Substrings inside words stay untouched.
+        assert_eq!(TranslationEngine::apply_glossary("Ratatouille", "en"), "Ratatouille");
+    }
+
+    #[test]
+    fn glossary_is_english_only() {
+        assert_eq!(TranslationEngine::apply_glossary("Gremio WTS", "es"), "Gremio WTS");
+    }
 
     #[test]
     fn ffff_markers_do_not_tank_spanish_confidence() {
