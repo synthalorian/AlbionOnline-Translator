@@ -25,7 +25,7 @@ pcap = { version = "2", features = ["capture-stream"] }
 thiserror = "2"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 urlencoding = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
