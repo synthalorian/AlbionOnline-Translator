@@ -33,7 +33,7 @@ lingua = { version = "1.8.0", features = ["chinese", "japanese", "korean", "russ
 ct2rs = "0.10.0"
 dirs = "6.0.0"
 ctrlc = "3.5.2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # On non-English Windows, Npcap/wpcap error strings are localized in legacy
 # codepages (CP1250 etc.) and fail pcap 2.x's strict UTF-8 check, masking the
