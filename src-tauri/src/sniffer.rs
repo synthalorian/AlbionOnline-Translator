@@ -101,8 +101,9 @@ fn device_label(dev: &Device) -> String {
 fn looks_like_tunnel(name: &str, desc: &str) -> bool {
     let text = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
     const TOKENS: &[&str] = &[
-        "warp", "wireguard", "wg", "nordlynx", "tailscale", "zerotier",
-        "openvpn", "tap", "tun", "utun", "tunnel", "vpn", "ppp", "wgcf",
+        "warp", "wireguard", "wg", "wintun", "nordlynx", "tailscale",
+        "zerotier", "openvpn", "mullvad", "protonvpn", "surfshark",
+        "expressvpn", "tap", "tun", "utun", "tunnel", "vpn", "ppp", "wgcf",
     ];
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|tok| {
@@ -123,6 +124,58 @@ fn looks_like_tunnel(name: &str, desc: &str) -> bool {
 
 fn is_tunnel_device(dev: &Device) -> bool {
     looks_like_tunnel(&dev.name, dev.desc.as_deref().unwrap_or(""))
+}
+
+/// Virtual hypervisor, VM, loopback, and WAN Miniport adapters that commonly
+/// carry private IPv4 addresses on Windows (e.g. Hyper-V/WSL vEthernet,
+/// VMware VMnet, VirtualBox Host-Only, NPF_Loopback) and should not beat a
+/// real physical NIC during fallback device selection.
+fn is_virtual_or_loopback(name: &str, desc: &str) -> bool {
+    let text = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
+    const PHRASES: &[&str] = &[
+        "npf_loopback",
+        "loopback",
+        "vethernet",
+        "hyper-v",
+        "vmware",
+        "vmnet",
+        "virtualbox",
+        "vboxnet",
+        "wan miniport",
+        "km-test",
+        "bluetooth",
+    ];
+    if PHRASES.iter().any(|p| text.contains(p)) {
+        return true;
+    }
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == "wsl" || tok == "vbox")
+}
+
+fn pick_fallback_device_index<'a, I>(candidates: I) -> Option<usize>
+where
+    I: IntoIterator<Item = (&'a str, &'a str, bool)>,
+{
+    let items: Vec<_> = candidates.into_iter().collect();
+    items
+        .iter()
+        .position(|(name, desc, has_ip)| {
+            *has_ip && !looks_like_tunnel(name, desc) && !is_virtual_or_loopback(name, desc)
+        })
+        .or_else(|| {
+            items
+                .iter()
+                .position(|(name, desc, has_ip)| *has_ip && !looks_like_tunnel(name, desc))
+        })
+}
+
+fn select_fallback_device(devices: &[Device]) -> Option<Device> {
+    pick_fallback_device_index(
+        devices
+            .iter()
+            .map(|d| (d.name.as_str(), d.desc.as_deref().unwrap_or(""), first_ipv4(d).is_some())),
+    )
+    .map(|idx| devices[idx].clone())
 }
 
 /// Is this address usable as evidence of a real network? Excludes loopback
@@ -369,16 +422,12 @@ fn select_device(preferred: Option<&str>) -> Result<Device, SnifferError> {
                 "Primary outbound device is a VPN/tunnel ({}); preferring physical adapter",
                 device_label(&tunnel)
             );
-            devices
-                .iter()
-                .find(|d| !is_tunnel_device(d) && first_ipv4(d).is_some())
-                .cloned()
+            select_fallback_device(&devices)
                 .or_else(|| Device::lookup().ok().flatten())
                 .ok_or(SnifferError::NoDevice)
         }
-        None => Device::lookup()
-            .ok()
-            .flatten()
+        None => select_fallback_device(&devices)
+            .or_else(|| Device::lookup().ok().flatten())
             .ok_or(SnifferError::NoDevice),
     }
 }
@@ -694,6 +743,33 @@ mod device_selection_tests {
         assert!(looks_like_tunnel("", "TAP-Windows Adapter V9"));
         assert!(looks_like_tunnel("tun0", ""));
         assert!(looks_like_tunnel("CloudflareWARP", ""));
+        assert!(looks_like_tunnel("wintun", "Wintun Userspace Tunnel"));
+        assert!(looks_like_tunnel("", "Mullvad Tunnel"));
+    }
+
+    #[test]
+    fn fallback_ranking_prefers_physical_over_windows_virtual_and_loopback() {
+        let candidates = [
+            ("\\Device\\NPF_Loopback", "Adapter for loopback traffic capture", true),
+            ("\\Device\\NPF_{111}", "Hyper-V Virtual Ethernet Adapter (vEthernet WSL)", true),
+            ("\\Device\\NPF_{222}", "VMware Virtual Ethernet Adapter for VMnet8", true),
+            ("\\Device\\NPF_{333}", "VirtualBox Host-Only Ethernet Adapter", true),
+            ("\\Device\\NPF_{444}", "Wintun Userspace Tunnel", true),
+            ("\\Device\\NPF_{555}", "Realtek PCIe GbE Family Controller", true),
+        ];
+        assert_eq!(pick_fallback_device_index(candidates), Some(5));
+    }
+
+    #[test]
+    fn virtual_or_loopback_ignores_physical_nics() {
+        assert!(!is_virtual_or_loopback(
+            "\\Device\\NPF_{88FA266C-1A3A-4044-BEE5-B452A5C4A23F}",
+            "Intel(R) Wi-Fi 6 AX201 160MHz"
+        ));
+        assert!(!is_virtual_or_loopback("", "Realtek Gaming 2.5GbE Family Controller"));
+        assert!(is_virtual_or_loopback("\\Device\\NPF_Loopback", "Adapter for loopback traffic capture"));
+        assert!(is_virtual_or_loopback("", "Microsoft KM-TEST Loopback Adapter"));
+        assert!(is_virtual_or_loopback("", "WAN Miniport (Network Monitor)"));
     }
 
     #[test]
