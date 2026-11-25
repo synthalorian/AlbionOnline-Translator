@@ -1,0 +1,116 @@
+# Build-only checks for pull requests. Does not create releases, upload
+# release assets, or use signing secrets.
+name: PR Build
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pr-build-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            tauri_args: --bundles nsis
+            rustflags: -Ctarget-feature=+crt-static
+          - os: ubuntu-22.04
+            tauri_args: --no-bundle
+            rustflags: ""
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Install Npcap SDK + extract runtime DLL (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # --- 1) Npcap SDK (import lib + headers for compile-time) ---
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.13.zip" -OutFile "npcap-sdk.zip"
+          Expand-Archive npcap-sdk.zip -DestinationPath C:\npcap-sdk -Force
+          "LIB=C:\npcap-sdk\Lib\x64;$env:LIB" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\npcap-sdk\Lib\x64" | Out-File -FilePath $env:GITHUB_PATH -Append
+          Write-Host "Npcap SDK extracted to C:\npcap-sdk"
+          Get-ChildItem "C:\npcap-sdk\Lib\x64" | ForEach-Object { Write-Host "  $($_.Name) ($($_.Length) bytes)" }
+
+          # --- 2) Npcap installer (contains the actual wpcap.dll runtime) ---
+          #     The SDK zip only has .lib import libraries — no DLLs.
+          #     wpcap.dll only ships inside the NSIS installer.
+          Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-1.78.exe" -OutFile "npcap-installer.exe"
+          & 7z x npcap-installer.exe -o"C:\npcap-extract" -y | Out-Null
+
+          # Find wpcap.dll + Packet.dll anywhere in the extracted tree.
+          # Npcap's wpcap.dll STATICALLY IMPORTS packet.dll — bundling wpcap.dll
+          # alone still fails to load at launch (Windows reports "wpcap.dll not
+          # found" even though the missing piece is its dependency Packet.dll).
+          $libDir = "C:\npcap-sdk\Lib\x64"
+          foreach ($name in @("wpcap.dll", "Packet.dll")) {
+            $dll = Get-ChildItem "C:\npcap-extract" -Recurse -Filter $name |
+                   Sort-Object Length -Descending |
+                   Select-Object -First 1
+            if (-not $dll) {
+              Write-Error "::error::$name not found inside npcap-1.78.exe — cannot link or run packet-capture tests"
+              exit 1
+            }
+            Copy-Item $dll.FullName "$libDir\$name" -Force
+            $sizeKB = [math]::Round($dll.Length / 1024)
+            Write-Host "Extracted ${name}: $($dll.FullName) -> $libDir\$name ($sizeKB KB)"
+          }
+
+          Remove-Item "C:\npcap-extract" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item npcap-installer.exe -ErrorAction SilentlyContinue
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check frontend
+        run: npm run check
+
+      - name: Run Rust tests
+        working-directory: src-tauri
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo test --locked
+
+      - name: Write CI Tauri config (skip updater signing)
+        shell: bash
+        run: printf '%s\n' '{"bundle":{"createUpdaterArtifacts":false}}' > src-tauri/tauri.ci.conf.json
+
+      - name: Build Tauri app (no signing, no release)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: npx tauri build ${{ matrix.tauri_args }} --config src-tauri/tauri.ci.conf.json
