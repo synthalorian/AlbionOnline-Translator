@@ -94,6 +94,15 @@ jobs:
           Remove-Item "C:\npcap-extract" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item npcap-installer.exe -ErrorAction SilentlyContinue
 
+          # tauri-build checks bundle resources during `cargo test` / `cargo build`.
+          # In the release workflow, fix-paths.cjs copies these during npm run build;
+          # PR CI runs cargo test first, so copy them here.
+          $resDir = "src-tauri/resources"
+          New-Item -ItemType Directory -Path $resDir -Force | Out-Null
+          Copy-Item "$libDir\wpcap.dll" $resDir -Force
+          Copy-Item "$libDir\Packet.dll" $resDir -Force
+          Get-ChildItem $resDir | ForEach-Object { Write-Host "  bundled resource $($_.Name) ($($_.Length) bytes)" }
+
       - name: Install frontend dependencies
         run: npm ci
 
