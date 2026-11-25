@@ -133,6 +133,21 @@ async fn set_channel_mapping(
     Ok(format!("Channel {} mapped to {}", channel_id, channel))
 }
 
+/// Rename a staged directory, retrying briefly on Windows PermissionDenied
+/// (antivirus / indexer locks on newly written model files).
+fn rename_dir_with_retry(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    for attempt in 0..5 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && attempt < 4 => {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    unreachable!("loop always returns on attempt 4")
+}
+
 #[tauri::command]
 async fn download_translation_model(lang: String) -> Result<String, String> {
     // `lang` becomes a path component — refuse anything but a language code
@@ -188,18 +203,21 @@ async fn download_translation_model(lang: String) -> Result<String, String> {
             }
         }
     }
-    std::fs::rename(&staging, &model_path).map_err(|e| e.to_string())?;
+    rename_dir_with_retry(&staging, &model_path).map_err(|e| e.to_string())?;
 
     Ok(format!("Downloaded {} model — restart app to activate", lang))
 }
 
 #[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> Result<String, String> {
+async fn check_for_updates(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<String, String> {
     use tauri_plugin_updater::UpdaterExt;
     match app.updater().map_err(|e| e.to_string())?.check().await {
         Ok(Some(update)) => {
             let version = update.version.clone();
             info!("Update available: {}", version);
+            // Release any active Npcap handle cleanly before the Windows
+            // updater spawns the installer and exits the process.
+            state.sniffer.lock().await.stop();
             // Download and install with progress
             match update.download_and_install(|_chunk, _total| {}, || {}).await {
                 Ok(()) => Ok(format!("Updated to {} — restart to apply", version)),
@@ -269,4 +287,23 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rename_dir_with_retry;
+
+    #[test]
+    fn rename_dir_with_retry_moves_directory() {
+        let base = std::env::temp_dir().join(format!("albion-rename-test-{}", std::process::id()));
+        let from = base.join("staging");
+        let to = base.join("final");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::write(from.join("model.bin"), b"ok").unwrap();
+
+        rename_dir_with_retry(&from, &to).unwrap();
+        assert!(!from.exists());
+        assert_eq!(std::fs::read(to.join("model.bin")).unwrap(), b"ok");
+        std::fs::remove_dir_all(&base).ok();
+    }
 }

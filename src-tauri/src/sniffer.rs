@@ -19,6 +19,38 @@ const BPF_FILTER: &str = "udp port 5055 or udp port 5056 or udp port 4535";
 
 const DEFAULT_HOSTS_PATH: &str = "hosts.txt";
 
+fn default_hosts_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = vec![std::path::PathBuf::from(DEFAULT_HOSTS_PATH)];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join(DEFAULT_HOSTS_PATH));
+        }
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        paths.push(cfg.join("albion-translator").join(DEFAULT_HOSTS_PATH));
+    }
+    paths
+}
+
+fn load_host_filter_from_paths(candidates: &[std::path::PathBuf]) -> Option<HostFilter> {
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match HostFilter::from_file(path) {
+            Ok(hf) if !hf.is_empty() => return Some(hf),
+            Ok(_) => {
+                info!("Ignoring empty hosts file {:?}", path);
+            }
+            Err(e) => {
+                error!("Failed to parse hosts file {:?}: {}", path, e);
+            }
+        }
+    }
+    None
+}
+
+
 /// Channel mappings persist across app restarts (same game session = same ids).
 /// Saved to ~/.config/albion-translator/channels.json.
 fn channel_map_path() -> std::path::PathBuf {
@@ -101,8 +133,9 @@ fn device_label(dev: &Device) -> String {
 fn looks_like_tunnel(name: &str, desc: &str) -> bool {
     let text = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
     const TOKENS: &[&str] = &[
-        "warp", "wireguard", "wg", "nordlynx", "tailscale", "zerotier",
-        "openvpn", "tap", "tun", "utun", "tunnel", "vpn", "ppp", "wgcf",
+        "warp", "wireguard", "wg", "wintun", "nordlynx", "tailscale",
+        "zerotier", "openvpn", "mullvad", "protonvpn", "surfshark",
+        "expressvpn", "tap", "tun", "utun", "tunnel", "vpn", "ppp", "wgcf",
     ];
     text.split(|c: char| !c.is_ascii_alphanumeric())
         .any(|tok| {
@@ -123,6 +156,58 @@ fn looks_like_tunnel(name: &str, desc: &str) -> bool {
 
 fn is_tunnel_device(dev: &Device) -> bool {
     looks_like_tunnel(&dev.name, dev.desc.as_deref().unwrap_or(""))
+}
+
+/// Virtual hypervisor, VM, loopback, and WAN Miniport adapters that commonly
+/// carry private IPv4 addresses on Windows (e.g. Hyper-V/WSL vEthernet,
+/// VMware VMnet, VirtualBox Host-Only, NPF_Loopback) and should not beat a
+/// real physical NIC during fallback device selection.
+fn is_virtual_or_loopback(name: &str, desc: &str) -> bool {
+    let text = format!("{} {}", name.to_lowercase(), desc.to_lowercase());
+    const PHRASES: &[&str] = &[
+        "npf_loopback",
+        "loopback",
+        "vethernet",
+        "hyper-v",
+        "vmware",
+        "vmnet",
+        "virtualbox",
+        "vboxnet",
+        "wan miniport",
+        "km-test",
+        "bluetooth",
+    ];
+    if PHRASES.iter().any(|p| text.contains(p)) {
+        return true;
+    }
+    text.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|tok| tok == "wsl" || tok == "vbox")
+}
+
+fn pick_fallback_device_index<'a, I>(candidates: I) -> Option<usize>
+where
+    I: IntoIterator<Item = (&'a str, &'a str, bool)>,
+{
+    let items: Vec<_> = candidates.into_iter().collect();
+    items
+        .iter()
+        .position(|(name, desc, has_ip)| {
+            *has_ip && !looks_like_tunnel(name, desc) && !is_virtual_or_loopback(name, desc)
+        })
+        .or_else(|| {
+            items
+                .iter()
+                .position(|(name, desc, has_ip)| *has_ip && !looks_like_tunnel(name, desc))
+        })
+}
+
+fn select_fallback_device(devices: &[Device]) -> Option<Device> {
+    pick_fallback_device_index(
+        devices
+            .iter()
+            .map(|d| (d.name.as_str(), d.desc.as_deref().unwrap_or(""), first_ipv4(d).is_some())),
+    )
+    .map(|idx| devices[idx].clone())
 }
 
 /// Is this address usable as evidence of a real network? Excludes loopback
@@ -207,6 +292,32 @@ pub struct DiagReport {
     pub photon_chat_decoded: u64,
 }
 
+/// Open a capture handle with `promisc(true)`, falling back to `promisc(false)`
+/// if the driver rejects promiscuous mode (common on Windows 10/11 Wi-Fi and
+/// USB Ethernet adapters). Returns `(handle, used_promisc)`.
+fn open_with_promisc_fallback<T, E, F>(mut open_fn: F) -> Result<(T, bool), E>
+where
+    F: FnMut(bool) -> Result<T, E>,
+{
+    match open_fn(true) {
+        Ok(cap) => Ok((cap, true)),
+        Err(_) => open_fn(false).map(|cap| (cap, false)),
+    }
+}
+
+fn open_capture_with_promisc(
+    device: &Device,
+    promisc: bool,
+) -> Result<Capture<pcap::Active>, pcap::Error> {
+    let inactive = Capture::from_device(device.clone())?
+        .promisc(promisc)
+        .snaplen(65535)
+        .timeout(1000);
+    #[cfg(windows)]
+    let inactive = inactive.immediate_mode(true);
+    inactive.open()
+}
+
 /// Blocking packet survey on the selected (or auto) device with NO filter.
 /// Call from spawn_blocking. Fails if the main capture is running.
 pub fn run_diagnostic(
@@ -222,13 +333,12 @@ pub fn run_diagnostic(
     let local_ips: Vec<IpAddr> = device.addresses.iter().map(|a| a.addr).collect();
     info!("Diagnostic capture on {} for {}s", label, duration_secs);
 
-    let mut cap = Capture::from_device(device)
-        .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?
-        .promisc(true)
-        .snaplen(65535)
-        .timeout(1000)
-        .open()
-        .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
+    let (mut cap, used_promisc) =
+        open_with_promisc_fallback(|promisc| open_capture_with_promisc(&device, promisc))
+            .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
+    if !used_promisc {
+        info!("Diagnostic capture fell back to non-promiscuous mode");
+    }
     // Deliberately NO BPF filter: we want to see everything the adapter sees.
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
@@ -344,16 +454,12 @@ fn select_device(preferred: Option<&str>) -> Result<Device, SnifferError> {
                 "Primary outbound device is a VPN/tunnel ({}); preferring physical adapter",
                 device_label(&tunnel)
             );
-            devices
-                .iter()
-                .find(|d| !is_tunnel_device(d) && first_ipv4(d).is_some())
-                .cloned()
+            select_fallback_device(&devices)
                 .or_else(|| Device::lookup().ok().flatten())
                 .ok_or(SnifferError::NoDevice)
         }
-        None => Device::lookup()
-            .ok()
-            .flatten()
+        None => select_fallback_device(&devices)
+            .or_else(|| Device::lookup().ok().flatten())
             .ok_or(SnifferError::NoDevice),
     }
 }
@@ -399,13 +505,9 @@ impl PacketSniffer {
         tx: mpsc::Sender<photon::ChatMessage>,
         translator: Arc<tokio::sync::Mutex<TranslationEngine>>,
     ) -> Self {
-        // Try to load hosts.txt from the current working directory; if it
-        // doesn't exist or is empty, run unfiltered (backward compat).
-        let host_filter = if std::path::Path::new(DEFAULT_HOSTS_PATH).exists() {
-            HostFilter::from_file(std::path::Path::new(DEFAULT_HOSTS_PATH)).ok()
-        } else {
-            None
-        };
+        // Try to load hosts.txt from CWD, beside the executable, or in the
+        // config directory; if absent or empty, run unfiltered.
+        let host_filter = load_host_filter_from_paths(&default_hosts_candidates());
 
         // Load persisted channel mappings from previous sessions
         let saved = load_channel_map();
@@ -456,17 +558,11 @@ impl PacketSniffer {
         // freshly relaunched app can hit a brief permission window. Retry
         // instead of failing the capture outright.
         for attempt in 1..=5 {
-            let inactive = match Capture::from_device(device.clone()) {
-                Ok(d) => d,
-                Err(e) => return Err(SnifferError::CaptureOpen(e.to_string())),
-            };
-            match inactive
-                .promisc(true)
-                .snaplen(65535)
-                .timeout(1000)
-                .open()
-            {
-                Ok(c) => {
+            match open_with_promisc_fallback(|promisc| open_capture_with_promisc(&device, promisc)) {
+                Ok((c, used_promisc)) => {
+                    if !used_promisc {
+                        info!("Capture fell back to non-promiscuous mode on {}", label);
+                    }
                     cap = Some(c);
                     break;
                 }
@@ -675,6 +771,52 @@ mod device_selection_tests {
         assert!(looks_like_tunnel("", "TAP-Windows Adapter V9"));
         assert!(looks_like_tunnel("tun0", ""));
         assert!(looks_like_tunnel("CloudflareWARP", ""));
+        assert!(looks_like_tunnel("wintun", "Wintun Userspace Tunnel"));
+        assert!(looks_like_tunnel("", "Mullvad Tunnel"));
+    }
+
+    #[test]
+    fn fallback_ranking_prefers_physical_over_windows_virtual_and_loopback() {
+        let candidates = [
+            ("\\Device\\NPF_Loopback", "Adapter for loopback traffic capture", true),
+            ("\\Device\\NPF_{111}", "Hyper-V Virtual Ethernet Adapter (vEthernet WSL)", true),
+            ("\\Device\\NPF_{222}", "VMware Virtual Ethernet Adapter for VMnet8", true),
+            ("\\Device\\NPF_{333}", "VirtualBox Host-Only Ethernet Adapter", true),
+            ("\\Device\\NPF_{444}", "Wintun Userspace Tunnel", true),
+            ("\\Device\\NPF_{555}", "Realtek PCIe GbE Family Controller", true),
+        ];
+        assert_eq!(pick_fallback_device_index(candidates), Some(5));
+    }
+
+    #[test]
+    fn virtual_or_loopback_ignores_physical_nics() {
+        assert!(!is_virtual_or_loopback(
+            "\\Device\\NPF_{88FA266C-1A3A-4044-BEE5-B452A5C4A23F}",
+            "Intel(R) Wi-Fi 6 AX201 160MHz"
+        ));
+        assert!(!is_virtual_or_loopback("", "Realtek Gaming 2.5GbE Family Controller"));
+        assert!(is_virtual_or_loopback("\\Device\\NPF_Loopback", "Adapter for loopback traffic capture"));
+        assert!(is_virtual_or_loopback("", "Microsoft KM-TEST Loopback Adapter"));
+        assert!(is_virtual_or_loopback("", "WAN Miniport (Network Monitor)"));
+    }
+
+    #[test]
+    fn hosts_loader_ignores_empty_and_picks_first_valid() {
+        let dir = std::env::temp_dir().join(format!("albion-hosts-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.txt");
+        let valid = dir.join("valid.txt");
+        let missing = dir.join("missing.txt");
+        std::fs::write(&empty, "# comment only
+   
+").unwrap();
+        std::fs::write(&valid, "5.188.125.0/24
+").unwrap();
+
+        assert!(load_host_filter_from_paths(&[missing.clone(), empty.clone()]).is_none());
+        let loaded = load_host_filter_from_paths(&[missing, empty, valid]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -720,6 +862,17 @@ mod device_selection_tests {
             .iter()
             .filter(|d| d.addresses.iter().any(|a| a.addr == ip))
             .collect();
+        // Without a kernel capture driver (Npcap on Windows CI with only the
+        // runtime DLLs), Device::list() often returns only the loopback
+        // adapter and cannot see the host's outbound NIC.
+        if matches.is_empty() {
+            eprintln!(
+                "skipping: primary IP {} is not on any capturable device ({})",
+                ip,
+                list_devices().join(" | ")
+            );
+            return;
+        }
         assert_eq!(
             matches.len(),
             1,
@@ -728,5 +881,43 @@ mod device_selection_tests {
             matches.iter().map(|d| &d.name).collect::<Vec<_>>(),
             list_devices().join(" | ")
         );
+    }
+
+    #[test]
+    fn promisc_fallback_uses_promisc_when_supported() {
+        let mut attempts = Vec::new();
+        let (val, used_promisc) = open_with_promisc_fallback(|p| -> Result<&str, &str> {
+            attempts.push(p);
+            Ok("opened")
+        })
+        .unwrap();
+        assert_eq!(val, "opened");
+        assert!(used_promisc);
+        assert_eq!(attempts, vec![true]);
+    }
+
+    #[test]
+    fn promisc_fallback_retries_without_promisc_on_rejection() {
+        let mut attempts = Vec::new();
+        let (val, used_promisc) = open_with_promisc_fallback(|p| {
+            attempts.push(p);
+            if p {
+                Err("failed to set hardware filter to promiscuous mode (31)")
+            } else {
+                Ok("opened-non-promisc")
+            }
+        })
+        .unwrap();
+        assert_eq!(val, "opened-non-promisc");
+        assert!(!used_promisc);
+        assert_eq!(attempts, vec![true, false]);
+    }
+
+    #[test]
+    fn promisc_fallback_returns_error_when_both_fail() {
+        let res = open_with_promisc_fallback(|p| -> Result<(), String> {
+            Err(format!("err(promisc={p})"))
+        });
+        assert_eq!(res.unwrap_err(), "err(promisc=false)");
     }
 }

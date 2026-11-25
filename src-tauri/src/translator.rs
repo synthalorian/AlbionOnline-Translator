@@ -245,8 +245,10 @@ impl TranslationEngine {
         std::fs::create_dir_all(&cache_dir).ok()?;
         let db_path = cache_dir.join("cache.db");
         let conn = Connection::open(&db_path).ok()?;
+        conn.busy_timeout(std::time::Duration::from_secs(5)).ok();
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS translations (
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE IF NOT EXISTS translations (
                 key TEXT PRIMARY KEY,
                 translated TEXT NOT NULL,
                 created_at INTEGER DEFAULT (unixepoch())
