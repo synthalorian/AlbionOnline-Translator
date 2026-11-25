@@ -19,6 +19,38 @@ const BPF_FILTER: &str = "udp port 5055 or udp port 5056 or udp port 4535";
 
 const DEFAULT_HOSTS_PATH: &str = "hosts.txt";
 
+fn default_hosts_candidates() -> Vec<std::path::PathBuf> {
+    let mut paths = vec![std::path::PathBuf::from(DEFAULT_HOSTS_PATH)];
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            paths.push(dir.join(DEFAULT_HOSTS_PATH));
+        }
+    }
+    if let Some(cfg) = dirs::config_dir() {
+        paths.push(cfg.join("albion-translator").join(DEFAULT_HOSTS_PATH));
+    }
+    paths
+}
+
+fn load_host_filter_from_paths(candidates: &[std::path::PathBuf]) -> Option<HostFilter> {
+    for path in candidates {
+        if !path.exists() {
+            continue;
+        }
+        match HostFilter::from_file(path) {
+            Ok(hf) if !hf.is_empty() => return Some(hf),
+            Ok(_) => {
+                info!("Ignoring empty hosts file {:?}", path);
+            }
+            Err(e) => {
+                error!("Failed to parse hosts file {:?}: {}", path, e);
+            }
+        }
+    }
+    None
+}
+
+
 /// Channel mappings persist across app restarts (same game session = same ids).
 /// Saved to ~/.config/albion-translator/channels.json.
 fn channel_map_path() -> std::path::PathBuf {
@@ -473,13 +505,9 @@ impl PacketSniffer {
         tx: mpsc::Sender<photon::ChatMessage>,
         translator: Arc<tokio::sync::Mutex<TranslationEngine>>,
     ) -> Self {
-        // Try to load hosts.txt from the current working directory; if it
-        // doesn't exist or is empty, run unfiltered (backward compat).
-        let host_filter = if std::path::Path::new(DEFAULT_HOSTS_PATH).exists() {
-            HostFilter::from_file(std::path::Path::new(DEFAULT_HOSTS_PATH)).ok()
-        } else {
-            None
-        };
+        // Try to load hosts.txt from CWD, beside the executable, or in the
+        // config directory; if absent or empty, run unfiltered.
+        let host_filter = load_host_filter_from_paths(&default_hosts_candidates());
 
         // Load persisted channel mappings from previous sessions
         let saved = load_channel_map();
@@ -770,6 +798,25 @@ mod device_selection_tests {
         assert!(is_virtual_or_loopback("\\Device\\NPF_Loopback", "Adapter for loopback traffic capture"));
         assert!(is_virtual_or_loopback("", "Microsoft KM-TEST Loopback Adapter"));
         assert!(is_virtual_or_loopback("", "WAN Miniport (Network Monitor)"));
+    }
+
+    #[test]
+    fn hosts_loader_ignores_empty_and_picks_first_valid() {
+        let dir = std::env::temp_dir().join(format!("albion-hosts-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let empty = dir.join("empty.txt");
+        let valid = dir.join("valid.txt");
+        let missing = dir.join("missing.txt");
+        std::fs::write(&empty, "# comment only
+   
+").unwrap();
+        std::fs::write(&valid, "5.188.125.0/24
+").unwrap();
+
+        assert!(load_host_filter_from_paths(&[missing.clone(), empty.clone()]).is_none());
+        let loaded = load_host_filter_from_paths(&[missing, empty, valid]).unwrap();
+        assert_eq!(loaded.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
