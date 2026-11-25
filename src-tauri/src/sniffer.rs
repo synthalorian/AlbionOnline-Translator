@@ -207,6 +207,32 @@ pub struct DiagReport {
     pub photon_chat_decoded: u64,
 }
 
+/// Open a capture handle with `promisc(true)`, falling back to `promisc(false)`
+/// if the driver rejects promiscuous mode (common on Windows 10/11 Wi-Fi and
+/// USB Ethernet adapters). Returns `(handle, used_promisc)`.
+fn open_with_promisc_fallback<T, E, F>(mut open_fn: F) -> Result<(T, bool), E>
+where
+    F: FnMut(bool) -> Result<T, E>,
+{
+    match open_fn(true) {
+        Ok(cap) => Ok((cap, true)),
+        Err(_) => open_fn(false).map(|cap| (cap, false)),
+    }
+}
+
+fn open_capture_with_promisc(
+    device: &Device,
+    promisc: bool,
+) -> Result<Capture<pcap::Active>, pcap::Error> {
+    let inactive = Capture::from_device(device.clone())?
+        .promisc(promisc)
+        .snaplen(65535)
+        .timeout(1000);
+    #[cfg(windows)]
+    let inactive = inactive.immediate_mode(true);
+    inactive.open()
+}
+
 /// Blocking packet survey on the selected (or auto) device with NO filter.
 /// Call from spawn_blocking. Fails if the main capture is running.
 pub fn run_diagnostic(
@@ -222,13 +248,12 @@ pub fn run_diagnostic(
     let local_ips: Vec<IpAddr> = device.addresses.iter().map(|a| a.addr).collect();
     info!("Diagnostic capture on {} for {}s", label, duration_secs);
 
-    let mut cap = Capture::from_device(device)
-        .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?
-        .promisc(true)
-        .snaplen(65535)
-        .timeout(1000)
-        .open()
-        .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
+    let (mut cap, used_promisc) =
+        open_with_promisc_fallback(|promisc| open_capture_with_promisc(&device, promisc))
+            .map_err(|e| SnifferError::CaptureOpen(e.to_string()))?;
+    if !used_promisc {
+        info!("Diagnostic capture fell back to non-promiscuous mode");
+    }
     // Deliberately NO BPF filter: we want to see everything the adapter sees.
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(duration_secs);
@@ -456,17 +481,11 @@ impl PacketSniffer {
         // freshly relaunched app can hit a brief permission window. Retry
         // instead of failing the capture outright.
         for attempt in 1..=5 {
-            let inactive = match Capture::from_device(device.clone()) {
-                Ok(d) => d,
-                Err(e) => return Err(SnifferError::CaptureOpen(e.to_string())),
-            };
-            match inactive
-                .promisc(true)
-                .snaplen(65535)
-                .timeout(1000)
-                .open()
-            {
-                Ok(c) => {
+            match open_with_promisc_fallback(|promisc| open_capture_with_promisc(&device, promisc)) {
+                Ok((c, used_promisc)) => {
+                    if !used_promisc {
+                        info!("Capture fell back to non-promiscuous mode on {}", label);
+                    }
                     cap = Some(c);
                     break;
                 }
@@ -728,5 +747,43 @@ mod device_selection_tests {
             matches.iter().map(|d| &d.name).collect::<Vec<_>>(),
             list_devices().join(" | ")
         );
+    }
+
+    #[test]
+    fn promisc_fallback_uses_promisc_when_supported() {
+        let mut attempts = Vec::new();
+        let (val, used_promisc) = open_with_promisc_fallback(|p| -> Result<&str, &str> {
+            attempts.push(p);
+            Ok("opened")
+        })
+        .unwrap();
+        assert_eq!(val, "opened");
+        assert!(used_promisc);
+        assert_eq!(attempts, vec![true]);
+    }
+
+    #[test]
+    fn promisc_fallback_retries_without_promisc_on_rejection() {
+        let mut attempts = Vec::new();
+        let (val, used_promisc) = open_with_promisc_fallback(|p| {
+            attempts.push(p);
+            if p {
+                Err("failed to set hardware filter to promiscuous mode (31)")
+            } else {
+                Ok("opened-non-promisc")
+            }
+        })
+        .unwrap();
+        assert_eq!(val, "opened-non-promisc");
+        assert!(!used_promisc);
+        assert_eq!(attempts, vec![true, false]);
+    }
+
+    #[test]
+    fn promisc_fallback_returns_error_when_both_fail() {
+        let res = open_with_promisc_fallback(|p| -> Result<(), String> {
+            Err(format!("err(promisc={p})"))
+        });
+        assert_eq!(res.unwrap_err(), "err(promisc=false)");
     }
 }
