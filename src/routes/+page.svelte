@@ -709,6 +709,7 @@
     class="user-translate-iframe"
     title="User translator"
     sandbox="allow-same-origin allow-scripts allow-forms"
+    allow="clipboard-write"
     onload={pushThemeToIframe}
   ></iframe>
   {/if}
@@ -866,6 +867,8 @@
     top: 50px;
     right: 10px;
     width: 260px;
+    max-height: calc(100vh - 64px);
+    overflow-y: auto;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 10px;
